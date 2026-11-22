@@ -18,6 +18,7 @@ type SendStream struct {
 
 	numOutstandingFrames int64 // outstanding STREAM and RESET_STREAM frames
 	retransmissionQueue  []*wire.StreamFrame
+	prefixRepair         *streamPrefixRepair
 
 	ctx       context.Context
 	ctxCancel context.CancelCauseFunc
@@ -340,6 +341,29 @@ func (s *SendStream) popStreamFrame(maxBytes protocol.ByteCount, v protocol.Vers
 	if f != nil {
 		s.numOutstandingFrames++
 	}
+	if repair := s.prefixRepair; repair != nil {
+		if f != nil && f.Offset == 0 && len(f.Data) > 0 && repair.data == nil {
+			// Capture only bytes the normal framer already charged to flow control.
+			repair.data = append([]byte(nil), f.Data[:min(repair.limit, len(f.Data))]...)
+		}
+		if len(repair.data) > 0 {
+			if f == nil {
+				// One visit per stream per packet. The regular packetizer and
+				// congestion controller decide when a second visit is possible.
+				copyFrame := &wire.StreamFrame{StreamID: s.streamID, Data: repair.data, DataLenPresent: true}
+				if copyFrame.Length(v) <= maxBytes {
+					repair.remaining--
+					if repair.remaining == 0 {
+						s.discardPrefixRepair()
+					}
+					more := hasMoreData || repair.remaining > 0
+					s.mutex.Unlock()
+					return ackhandler.StreamFrame{Frame: copyFrame, Handler: (*prefixRepairHandler)(s)}, blocked, more
+				}
+			}
+			hasMoreData = true
+		}
+	}
 	s.mutex.Unlock()
 
 	if f == nil {
@@ -629,6 +653,7 @@ func (s *SendStream) CancelWrite(errorCode StreamErrorCode) {
 		}
 		return
 	}
+	s.discardPrefixRepair()
 	s.resetErr = &StreamError{StreamID: s.streamID, ErrorCode: errorCode, Remote: false}
 	s.ctxCancel(s.resetErr)
 
@@ -723,6 +748,7 @@ func (s *SendStream) handleStopSendingFrame(f *wire.StopSendingFrame) {
 	}
 	s.returnFramesToPool()
 	if s.resetErr == nil {
+		s.discardPrefixRepair()
 		s.resetErr = &StreamError{StreamID: s.streamID, ErrorCode: f.ErrorCode, Remote: true}
 		s.ctxCancel(s.resetErr)
 	}
@@ -787,6 +813,7 @@ func (s *SendStream) SetWriteDeadline(t time.Time) error {
 // The peer will NOT be informed about this: the stream is closed without sending a FIN or RST.
 func (s *SendStream) closeForShutdown(err error) {
 	s.mutex.Lock()
+	s.discardPrefixRepair()
 	if s.shutdownErr == nil && !s.finishedWriting {
 		s.shutdownErr = err
 		s.returnFramesToPool()
@@ -810,9 +837,11 @@ var _ ackhandler.FrameHandler = &sendStreamAckHandler{}
 
 func (s *sendStreamAckHandler) OnAcked(f wire.Frame) {
 	sf := f.(*wire.StreamFrame)
-	sf.PutBack()
-
 	s.mutex.Lock()
+	if repair := s.prefixRepair; repair != nil && sf.Offset == 0 && len(repair.data) > 0 && len(sf.Data) >= len(repair.data) {
+		(*SendStream)(s).discardPrefixRepair()
+	}
+	sf.PutBack()
 	if s.resetErr != nil && (*SendStream)(s).reliableOffset() == 0 {
 		s.mutex.Unlock()
 		return
@@ -912,4 +941,53 @@ func (s *sendStreamResetStreamHandler) OnLost(f wire.Frame) {
 	s.numOutstandingFrames--
 	s.mutex.Unlock()
 	s.sender.onHasStreamControlFrame(s.streamID, (*SendStream)(s))
+}
+
+type streamPrefixRepair struct {
+	limit, remaining int
+	data             []byte
+}
+
+// The caller holds the stream mutex. Dropping the byte slice also releases
+// it for callers that retain the idempotent cancellation closure.
+func (s *SendStream) discardPrefixRepair() {
+	if s.prefixRepair != nil {
+		s.prefixRepair.data = nil
+		s.prefixRepair = nil
+	}
+}
+
+type prefixRepairHandler SendStream
+
+// A lost optional copy is never retransmitted. The original STREAM frame
+// retains sole responsibility for reliable delivery and stream completion.
+func (*prefixRepairHandler) OnLost(wire.Frame) {}
+
+func (s *prefixRepairHandler) OnAcked(wire.Frame) {
+	s.mutex.Lock()
+	(*SendStream)(s).discardPrefixRepair()
+	s.mutex.Unlock()
+}
+
+// ProtectInitialPrefix asks QUIC to offer up to three best-effort redundant
+// transmissions of at most the first 512 bytes on this stream. Call before
+// its first write. All copies use the original stream ID and offset and pass
+// through normal congestion control. Call the returned function to withdraw
+// unsent copies. A nil result means no protection was installed.
+func (s *Stream) ProtectInitialPrefix(bytes, copies int) func() {
+	w := s.sendStr
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+	if w.writeOffset != 0 || w.prefixRepair != nil || w.resetErr != nil || w.shutdownErr != nil || w.finishedWriting || bytes <= 0 || copies <= 0 {
+		return nil
+	}
+	repair := &streamPrefixRepair{limit: min(512, bytes), remaining: min(3, copies)}
+	w.prefixRepair = repair
+	return func() {
+		w.mutex.Lock()
+		if w.prefixRepair == repair {
+			w.discardPrefixRepair()
+		}
+		w.mutex.Unlock()
+	}
 }
