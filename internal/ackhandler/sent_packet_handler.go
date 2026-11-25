@@ -1,8 +1,10 @@
 package ackhandler
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -101,8 +103,38 @@ type sentPacketHandler struct {
 
 	congestion      congestion.SendAlgorithmWithDebugInfos
 	congestionMutex sync.RWMutex
-	rttStats        *utils.RTTStats
-	connStats       *utils.ConnectionStats
+	// pathSender is set when the installed controller implements
+	// congestion.PathSender. It then receives exact packet events instead of
+	// the per-packet callbacks, and admits every ordinary packet.
+	pathSender congestionExt.PathSender
+	// permit is the answer to the last Admit. It covers the next packet only.
+	permit congestionExt.Permit
+	// admissionRefused says the last SendMode refused for the PathSender,
+	// not for a transport limit.
+	admissionRefused bool
+	// grantPending is the verification grant the next packet was built
+	// under, or zero.
+	grantPending uint64
+	// ackLenPending is the size of the next packet's ACK frame.
+	ackLenPending protocol.ByteCount
+	// discardRefs is scratch space for OnDiscarded.
+	discardRefs []congestionExt.PacketRef
+	// lateAcks holds the ack-eliciting application packets declared lost,
+	// for the horizon of the lost-packet tracker. A later acknowledgement of
+	// one is transport progress and, if it was reported lost to the installed
+	// PathSender, a correction of exactly that reference.
+	// It is sorted by packet number and pruned from the front, so matching an
+	// ACK against it is linear in the ACK's ranges and the records it covers.
+	lateAcks []lostRecord
+	// controllerGen identifies the installed PathSender.
+	controllerGen uint32
+	// appInFlight is the application-data part of bytesInFlight.
+	appInFlight protocol.ByteCount
+
+	progress  utils.TransportProgress
+	published utils.TransportProgress
+	rttStats  *utils.RTTStats
+	connStats *utils.ConnectionStats
 
 	// The number of times a PTO has been sent without receiving an ack.
 	ptoCount uint32
@@ -134,6 +166,14 @@ type sentPacketHandler struct {
 }
 
 var _ SentPacketHandler = &sentPacketHandler{}
+
+type lostRecord struct {
+	pn       protocol.PacketNumber
+	size     protocol.ByteCount
+	sent     monotime.Time
+	reported bool   // to a PathSender
+	gen      uint32 // the PathSender it was reported to
+}
 
 // clientAddressValidated indicates whether the address was validated beforehand by an address validation token.
 // If the address was validated, the amplification limit doesn't apply. It has no effect for a client.
@@ -189,6 +229,9 @@ func (h *sentPacketHandler) removeFromBytesInFlight(p *packet) {
 			panic("negative bytes_in_flight")
 		}
 		h.bytesInFlight -= p.Length
+		if p.EncryptionLevel == protocol.Encryption1RTT || p.EncryptionLevel == protocol.Encryption0RTT {
+			h.appInFlight -= p.Length
+		}
 		p.includedInBytesInFlight = false
 	}
 }
@@ -199,6 +242,8 @@ func (h *sentPacketHandler) DropPackets(encLevel protocol.EncryptionLevel, now m
 	if h.perspective == protocol.PerspectiveClient && encLevel == protocol.EncryptionHandshake {
 		h.peerCompletedAddressValidation = true
 	}
+	ps := h.getPathSender()
+	h.discardRefs = h.discardRefs[:0]
 	// remove outstanding packets from bytes_in_flight
 	if encLevel == protocol.EncryptionInitial || encLevel == protocol.EncryptionHandshake {
 		pnSpace := h.getPacketNumberSpace(encLevel)
@@ -206,7 +251,10 @@ func (h *sentPacketHandler) DropPackets(encLevel protocol.EncryptionLevel, now m
 		if pnSpace == nil {
 			return
 		}
-		for _, p := range pnSpace.history.Packets() {
+		for pn, p := range pnSpace.history.Packets() {
+			if ps != nil && p.includedInBytesInFlight {
+				h.discardRefs = append(h.discardRefs, packetRef(encLevel, pn, p.Length))
+			}
 			h.removeFromBytesInFlight(p)
 		}
 	}
@@ -229,11 +277,23 @@ func (h *sentPacketHandler) DropPackets(encLevel protocol.EncryptionLevel, now m
 			if p.EncryptionLevel != protocol.Encryption0RTT {
 				break
 			}
+			if ps != nil && p.includedInBytesInFlight {
+				h.discardRefs = append(h.discardRefs, packetRef(protocol.Encryption0RTT, pn, p.Length))
+			}
 			h.removeFromBytesInFlight(p)
 			h.appDataPackets.history.Remove(pn)
 		}
 	default:
 		panic(fmt.Sprintf("Cannot drop keys for encryption level %s", encLevel))
+	}
+	if ps != nil {
+		if encLevel == protocol.Encryption0RTT {
+			ps.OnDiscarded(now, congestionExt.ByteCount(h.bytesInFlight), h.discardRefs, false, congestionExt.DiscardZeroRTTRejected)
+		} else {
+			ps.OnDiscarded(now, congestionExt.ByteCount(h.bytesInFlight), h.discardRefs, true, congestionExt.DiscardKeyDrop)
+		}
+		clear(h.discardRefs)
+		h.discardRefs = h.discardRefs[:0]
 	}
 	if h.qlogger != nil && h.ptoCount != 0 {
 		h.qlogger.RecordEvent(qlog.PTOCountUpdated{PTOCount: 0})
@@ -307,22 +367,56 @@ func (h *sentPacketHandler) SentPacket(
 	p.isPathProbePacket = isPathProbePacket
 	isAckEliciting := p.IsAckEliciting()
 
+	cc, ps := h.getControllers()
+	// A permit covers exactly one packet. It is only used, and only touched,
+	// on the run loop while a PathSender is installed.
+	// A permit covers the build that follows the Admit that issued it --
+	// every packet of a coalesced datagram, handshake-only builds included --
+	// and is withdrawn by the next SendMode. Each packet of a batch is
+	// preceded by its own SendMode.
+	var underPermit bool
+	if ps != nil {
+		underPermit = h.permit.OK
+	}
+
 	if isPathProbePacket {
 		pnSpace.history.SentPathProbePacket(pn, p)
+		if ps != nil {
+			h.ackLenPending = 0
+			ps.OnSent(h.sentPacketInfo(t, encLevel, pn, p, congestionExt.KindPathProbe, true, 0))
+		}
 		h.setLossDetectionTimer(t)
 		return
 	}
+	isProbe := false
 	if isAckEliciting {
 		pnSpace.lastAckElicitingPacketTime = t
 		h.bytesInFlight += size
+		if encLevel == protocol.Encryption1RTT || encLevel == protocol.Encryption0RTT {
+			h.appInFlight += size
+		}
 		p.includedInBytesInFlight = true
 		if h.numProbesToSend > 0 {
 			h.numProbesToSend--
+			isProbe = true
 		}
 	}
 
-	cc := h.getCongestionControl()
-	cc.OnPacketSent(t, h.bytesInFlight, pn, size, isAckEliciting)
+	if ps != nil {
+		kind := h.packetKind(encLevel, p, isAckEliciting, isProbe)
+		grant := h.grantPending
+		h.grantPending = 0
+		if grant != 0 {
+			kind = congestionExt.KindVerification
+		}
+		ackLen := h.ackLenPending
+		h.ackLenPending = 0
+		info := h.sentPacketInfo(t, encLevel, pn, p, kind, !underPermit, ackLen)
+		info.Grant = grant
+		ps.OnSent(info)
+	} else {
+		cc.OnPacketSent(t, h.bytesInFlight, pn, size, isAckEliciting)
+	}
 
 	if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
 		h.ecnTracker.SentPacket(pn, ecn)
@@ -422,11 +516,27 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 
 	priorInFlight := h.bytesInFlight
 	ackedPackets, hasAckEliciting, err := h.detectAndRemoveAckedPackets(ack, encLevel)
-	if err != nil || len(ackedPackets) == 0 {
+	if err != nil {
 		return false, err
 	}
-
-	cc := h.getCongestionControl()
+	cc, ps := h.getControllers()
+	if len(ackedPackets) == 0 {
+		// An ACK that covers only packets already declared lost still
+		// corrects them, as long as the lost-packet tracker holds them.
+		if encLevel == protocol.Encryption1RTT {
+			spurious := h.creditLateAcks(ack, rcvTime, ps)
+			h.publishProgress()
+			if ps != nil && len(spurious) > 0 {
+				ps.OnAckEvent(congestionExt.AckEvent{
+					Time:     rcvTime,
+					InFlight: congestionExt.ByteCount(h.bytesInFlight),
+					Spurious: spurious,
+				})
+			}
+		}
+		return false, nil
+	}
+	var event congestionExt.AckEvent
 
 	// update the RTT, if:
 	// * the largest acked is newly acknowledged, AND
@@ -440,12 +550,15 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 			}
 			if h.largestAckedTime.IsZero() || !p.SendTime.Before(h.largestAckedTime) {
 				h.rttStats.UpdateRTT(rcvTime.Sub(p.SendTime), ackDelay)
+				event.RTTSample = rcvTime.Sub(p.SendTime)
 				if h.logger.Debug() {
 					h.logger.Debugf("\tupdated RTT: %s (σ: %s)", h.rttStats.SmoothedRTT(), h.rttStats.MeanDeviation())
 				}
 				h.largestAckedTime = p.SendTime
 			}
-			cc.MaybeExitSlowStart()
+			if ps == nil {
+				cc.MaybeExitSlowStart()
+			}
 		}
 	}
 
@@ -453,7 +566,11 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil && largestAcked > pnSpace.largestAcked {
 		congested := h.ecnTracker.HandleNewlyAcked(ackedPackets, int64(ack.ECT0), int64(ack.ECT1), int64(ack.ECNCE))
 		if congested {
-			cc.OnCongestionEvent(largestAcked, 0, priorInFlight)
+			if ps != nil {
+				event.ECNCongestion = true
+			} else {
+				cc.OnCongestionEvent(largestAcked, 0, priorInFlight)
+			}
 		}
 	}
 
@@ -467,7 +584,11 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	var acked1RTTPacket bool
 	for _, p := range ackedPackets {
 		if p.includedInBytesInFlight {
-			cc.OnPacketAcked(p.PacketNumber, p.Length, priorInFlight, rcvTime)
+			if ps != nil {
+				event.Acked = append(event.Acked, packetRef(encLevel, p.PacketNumber, p.Length))
+			} else {
+				cc.OnPacketAcked(p.PacketNumber, p.Length, priorInFlight, rcvTime)
+			}
 			h.ackedPacketsInfo = append(h.ackedPacketsInfo, congestionExt.AckedPacketInfo{
 				PacketNumber: congestionExt.PacketNumber(p.PacketNumber),
 				BytesAcked:   congestionExt.ByteCount(p.Length),
@@ -476,17 +597,30 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		if p.EncryptionLevel == protocol.Encryption1RTT {
 			acked1RTTPacket = true
 		}
+		if (p.EncryptionLevel == protocol.Encryption1RTT || p.EncryptionLevel == protocol.Encryption0RTT) &&
+			!p.isPathProbePacket && p.IsAckEliciting() {
+			h.progress.Epoch++
+			h.progress.Last = rcvTime
+			h.progress.PTOExpiries = 0
+		}
 		h.removeFromBytesInFlight(p.packet)
 		if !p.isPathProbePacket {
 			putPacket(p.packet)
 		}
 	}
 
-	if cex, ok := h.getCongestionControl().(congestion.SendAlgorithmEx); ok &&
-		(len(h.ackedPacketsInfo) != 0 || len(h.lostPacketsInfo) != 0) {
-		cex.OnCongestionEventEx(priorInFlight, rcvTime, h.ackedPacketsInfo, h.lostPacketsInfo)
+	if ps == nil {
+		if cex, ok := cc.(congestion.SendAlgorithmEx); ok &&
+			(len(h.ackedPacketsInfo) != 0 || len(h.lostPacketsInfo) != 0) {
+			cex.OnCongestionEventEx(priorInFlight, rcvTime, h.ackedPacketsInfo, h.lostPacketsInfo)
+		}
 	}
 
+	// A late acknowledgement of a packet declared lost, from a reordered ACK
+	// too, is progress and corrects the loss.
+	if encLevel == protocol.Encryption1RTT {
+		event.Spurious = h.creditLateAcks(ack, rcvTime, ps)
+	}
 	// detect spurious losses for application data packets, if the ACK was not reordered
 	if encLevel == protocol.Encryption1RTT && largestAcked == pnSpace.largestAcked {
 		h.detectSpuriousLosses(
@@ -495,6 +629,12 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		)
 		// clean up lost packet history
 		h.lostPackets.DeleteBefore(rcvTime.Add(-3 * h.rttStats.PTO(false)))
+	}
+	if ps != nil {
+		event.Time = rcvTime
+		event.InFlight = congestionExt.ByteCount(h.bytesInFlight)
+		event.Lost = h.lostRefs(encLevel)
+		ps.OnAckEvent(event)
 	}
 
 	// After this point, we must not use ackedPackets any longer!
@@ -559,6 +699,67 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 	}
 	for _, pn := range spuriousLosses {
 		h.lostPackets.Delete(pn)
+	}
+}
+
+// maxLateAcks bounds the late-acknowledgement history.
+const maxLateAcks = 256
+
+// creditLateAcks finds the ack-eliciting application packets declared lost
+// that this ACK acknowledges. Each is transport progress. It returns those
+// reported lost to the installed PathSender, as the references that were
+// reported, and forgets records past the lost-packet tracker's horizon. The
+// records are sorted by packet number, so each ACK range is found by binary
+// search: an ACK that covers none of them costs O(ranges * log records).
+func (h *sentPacketHandler) creditLateAcks(ack *wire.AckFrame, rcvTime monotime.Time, ps congestionExt.PathSender) []congestionExt.PacketRef {
+	if len(h.lateAcks) == 0 {
+		return nil
+	}
+	// Records are appended in roughly send order, so expiry is at the front.
+	horizon := rcvTime.Add(-3 * h.rttStats.PTO(false))
+	n := 0
+	for n < len(h.lateAcks) && h.lateAcks[n].sent.Before(horizon) {
+		n++
+	}
+	if n > 0 {
+		h.lateAcks = slices.Delete(h.lateAcks, 0, n)
+	}
+	byNumber := func(e lostRecord, pn protocol.PacketNumber) int { return cmp.Compare(e.pn, pn) }
+	var refs []congestionExt.PacketRef
+	for _, r := range ack.AckRanges {
+		lo, _ := slices.BinarySearchFunc(h.lateAcks, r.Smallest, byNumber)
+		hi, found := slices.BinarySearchFunc(h.lateAcks, r.Largest, byNumber)
+		if found {
+			hi++
+		}
+		if lo >= hi {
+			continue
+		}
+		for _, rec := range h.lateAcks[lo:hi] {
+			h.progress.Epoch++
+			h.progress.Last = rcvTime
+			h.progress.PTOExpiries = 0
+			if ps != nil && rec.reported && rec.gen == h.controllerGen {
+				refs = append(refs, congestionExt.PacketRef{Space: congestionExt.SpaceApplication, Number: congestionExt.PacketNumber(rec.pn), Bytes: congestionExt.ByteCount(rec.size)})
+			}
+		}
+		h.lateAcks = slices.Delete(h.lateAcks, lo, hi)
+	}
+	slices.SortFunc(refs, func(a, b congestionExt.PacketRef) int { return cmp.Compare(a.Number, b.Number) })
+	return refs
+}
+
+// recordLateAck remembers an ack-eliciting application packet that left the
+// flight without a fate known to be final.
+func (h *sentPacketHandler) recordLateAck(r lostRecord) {
+	i, _ := slices.BinarySearchFunc(h.lateAcks, r.pn, func(e lostRecord, pn protocol.PacketNumber) int { return cmp.Compare(e.pn, pn) })
+	if i < len(h.lateAcks) && h.lateAcks[i].pn == r.pn {
+		h.lateAcks[i] = r
+		return
+	}
+	h.lateAcks = slices.Insert(h.lateAcks, i, r)
+	if len(h.lateAcks) > maxLateAcks {
+		h.lateAcks = slices.Delete(h.lateAcks, 0, len(h.lateAcks)-maxLateAcks)
 	}
 }
 
@@ -734,6 +935,7 @@ func (h *sentPacketHandler) hasOutstandingCryptoPackets() bool {
 }
 
 func (h *sentPacketHandler) setLossDetectionTimer(now monotime.Time) {
+	h.publishProgress()
 	oldAlarm := h.alarm // only needed in case tracing is enabled
 	newAlarm := h.lossDetectionTime(now)
 	h.alarm = newAlarm
@@ -838,7 +1040,7 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 	// Packets sent before this time are deemed lost.
 	lostSendTime := now.Add(-lossDelay)
 
-	cc := h.getCongestionControl()
+	cc, ps := h.getControllers()
 
 	priorInFlight := h.bytesInFlight
 	for pn, p := range pnSpace.history.Packets() {
@@ -897,12 +1099,22 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 				h.removeFromBytesInFlight(p)
 				h.queueFramesForRetransmission(p)
 				if !p.IsPathMTUProbePacket {
-					cc.OnCongestionEvent(pn, p.Length, priorInFlight)
+					if ps == nil {
+						cc.OnCongestionEvent(pn, p.Length, priorInFlight)
+					} else {
+						// The legacy controller counts these; with a
+						// PathSender the transport does.
+						h.connStats.PacketsLost.Add(1)
+						h.connStats.BytesLost.Add(uint64(p.Length))
+					}
 				}
 				h.lostPacketsInfo = append(h.lostPacketsInfo, congestionExt.LostPacketInfo{
 					PacketNumber: congestionExt.PacketNumber(pn),
 					BytesLost:    congestionExt.ByteCount(p.Length),
 				})
+				if encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT {
+					h.recordLateAck(lostRecord{pn: pn, size: p.Length, sent: p.SendTime, reported: ps != nil, gen: h.controllerGen})
+				}
 				if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
 					h.ecnTracker.LostPacket(pn)
 				}
@@ -934,7 +1146,16 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 		// Early retransmit or time loss detection
 		h.detectLostPackets(now, encLevel)
 
-		if cex, ok := h.getCongestionControl().(congestion.SendAlgorithmEx); ok &&
+		cc, ps := h.getControllers()
+		if ps != nil {
+			ps.OnAckEvent(congestionExt.AckEvent{
+				Time:     now,
+				InFlight: congestionExt.ByteCount(h.bytesInFlight),
+				Lost:     h.lostRefs(encLevel),
+			})
+			return nil
+		}
+		if cex, ok := cc.(congestion.SendAlgorithmEx); ok &&
 			len(h.lostPacketsInfo) != 0 {
 			cex.OnCongestionEventEx(priorInFlight, now, nil, h.lostPacketsInfo)
 		}
@@ -948,6 +1169,7 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 	// actually packets outstanding.
 	if h.bytesInFlight == 0 && !h.peerCompletedAddressValidation {
 		h.ptoCount++
+		h.progress.PTOExpiries++
 		h.numProbesToSend++
 		if h.initialPackets != nil {
 			h.ptoMode = SendPTOInitial
@@ -968,6 +1190,7 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 		return nil
 	}
 	h.ptoCount++
+	h.progress.PTOExpiries++
 	if h.logger.Debug() {
 		h.logger.Debugf("Loss detection alarm for %s fired in PTO mode. PTO count: %d", encLevel, h.ptoCount)
 	}
@@ -1052,6 +1275,11 @@ func (h *sentPacketHandler) PopPacketNumber(encLevel protocol.EncryptionLevel) p
 }
 
 func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
+	cc, ps := h.getControllers()
+	if ps != nil {
+		// A permit covers only the build that follows the Admit that issued it.
+		h.permit = congestionExt.Permit{}
+	}
 	numTrackedPackets := h.appDataPackets.history.Len()
 	if h.initialPackets != nil {
 		numTrackedPackets += h.initialPackets.history.Len()
@@ -1077,8 +1305,10 @@ func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
 	if h.numProbesToSend > 0 {
 		return h.ptoMode
 	}
+	if ps != nil {
+		return h.pathSenderSendMode(ps, now, numTrackedPackets)
+	}
 	// Only send ACKs if we're congestion limited.
-	cc := h.getCongestionControl()
 	if !cc.CanSend(h.bytesInFlight) {
 		if h.logger.Debug() {
 			h.logger.Debugf("Congestion limited: bytes in flight %d, window %d", h.bytesInFlight, cc.GetCongestionWindow())
@@ -1097,8 +1327,42 @@ func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
 	return SendAny
 }
 
+// pathSenderSendMode asks a PathSender for a permit in place of CanSend and
+// HasPacingBudget. A window refusal (no RetryAt) maps to SendAck, a pacing or
+// precedence refusal to SendPacingLimited, in the same order as for any other
+// controller.
+func (h *sentPacketHandler) pathSenderSendMode(ps congestionExt.PathSender, now monotime.Time, numTrackedPackets int) SendMode {
+	h.permit = ps.Admit(now, congestionExt.ByteCount(h.maxDatagramSize))
+	// The transport's outstanding-packet limit comes first: whatever the
+	// controller answered, only an ACK may go, and no exempt obligation or
+	// grant may spend the headroom kept for ACKs.
+	if numTrackedPackets >= protocol.MaxOutstandingSentPackets {
+		h.permit = congestionExt.Permit{}
+		h.admissionRefused = false
+		if h.logger.Debug() {
+			h.logger.Debugf("Max outstanding limited: tracking %d packets, maximum: %d", numTrackedPackets, protocol.MaxOutstandingSentPackets)
+		}
+		return SendAck
+	}
+	h.admissionRefused = !h.permit.OK
+	if !h.permit.OK && h.permit.RetryAt.IsZero() {
+		if h.logger.Debug() {
+			h.logger.Debugf("Congestion limited: bytes in flight %d", h.bytesInFlight)
+		}
+		return SendAck
+	}
+	if !h.permit.OK {
+		return SendPacingLimited
+	}
+	return SendAny
+}
+
 func (h *sentPacketHandler) TimeUntilSend() monotime.Time {
-	return h.getCongestionControl().TimeUntilSend(h.bytesInFlight)
+	cc, ps := h.getControllers()
+	if ps != nil {
+		return h.permit.RetryAt
+	}
+	return cc.TimeUntilSend(h.bytesInFlight)
 }
 
 func (h *sentPacketHandler) SetMaxDatagramSize(s protocol.ByteCount) {
@@ -1127,7 +1391,17 @@ func (h *sentPacketHandler) QueueProbePacket(encLevel protocol.EncryptionLevel) 
 	// Keep track of acknowledged frames instead.
 	// Call DeclareLost before queueFramesForRetransmission, which clears the packet's frames.
 	pnSpace.history.DeclareLost(pn)
+	wasInFlight := p.includedInBytesInFlight
+	if (encLevel == protocol.Encryption1RTT || encLevel == protocol.Encryption0RTT) && p.IsAckEliciting() && !p.isPathProbePacket {
+		// It may still be acknowledged: that is progress, not a correction.
+		h.recordLateAck(lostRecord{pn: pn, size: p.Length, sent: p.SendTime})
+	}
 	h.removeFromBytesInFlight(p)
+	if ps := h.getPathSender(); ps != nil && wasInFlight {
+		refs := append(h.discardRefs[:0], packetRef(encLevel, pn, p.Length))
+		ps.OnDiscarded(monotime.Now(), congestionExt.ByteCount(h.bytesInFlight), refs, false, congestionExt.DiscardPTOProbe)
+		h.discardRefs = refs[:0]
+	}
 	h.queueFramesForRetransmission(p)
 	return true
 }
@@ -1152,10 +1426,16 @@ func (h *sentPacketHandler) queueFramesForRetransmission(p *packet) {
 
 func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 	h.bytesInFlight = 0
+	h.appInFlight = 0
+	ps := h.getPathSender()
+	h.discardRefs = h.discardRefs[:0]
 	var firstPacketSendTime monotime.Time
-	for _, p := range h.initialPackets.history.Packets() {
+	for pn, p := range h.initialPackets.history.Packets() {
 		if firstPacketSendTime.IsZero() {
 			firstPacketSendTime = p.SendTime
+		}
+		if ps != nil && p.includedInBytesInFlight {
+			h.discardRefs = append(h.discardRefs, packetRef(protocol.EncryptionInitial, pn, p.Length))
 		}
 		if p.IsAckEliciting() {
 			h.queueFramesForRetransmission(p)
@@ -1163,10 +1443,18 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 	}
 	// All application data packets sent at this point are 0-RTT packets.
 	// In the case of a Retry, we can assume that the server dropped all of them.
-	for _, p := range h.appDataPackets.history.Packets() {
+	for pn, p := range h.appDataPackets.history.Packets() {
+		if ps != nil && p.includedInBytesInFlight {
+			h.discardRefs = append(h.discardRefs, packetRef(protocol.Encryption0RTT, pn, p.Length))
+		}
 		if p.IsAckEliciting() {
 			h.queueFramesForRetransmission(p)
 		}
+	}
+	if ps != nil {
+		ps.OnDiscarded(now, 0, h.discardRefs, true, congestionExt.DiscardRetry)
+		clear(h.discardRefs)
+		h.discardRefs = h.discardRefs[:0]
 	}
 
 	// Only use the Retry to estimate the RTT if we didn't send any retransmission for the Initial.
@@ -1183,6 +1471,7 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 	}
 	h.initialPackets = newPacketNumberSpace(h.initialPackets.pns.Peek(), false)
 	h.appDataPackets = newPacketNumberSpace(h.appDataPackets.pns.Peek(), true)
+	h.publishProgress()
 	oldAlarm := h.alarm
 	h.alarm = alarmTimer{}
 	if h.qlogger != nil {
@@ -1198,9 +1487,18 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 
 func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSize protocol.ByteCount) {
 	h.rttStats.ResetForPathMigration()
+	ps := h.getPathSender()
+	h.discardRefs = h.discardRefs[:0]
 	for pn, p := range h.appDataPackets.history.Packets() {
 		h.appDataPackets.history.DeclareLost(pn)
 		if !p.isPathProbePacket {
+			if ps != nil && p.includedInBytesInFlight {
+				h.discardRefs = append(h.discardRefs, packetRef(protocol.Encryption1RTT, pn, p.Length))
+			}
+			if p.IsAckEliciting() {
+				// A late acknowledgement is still progress, not a correction.
+				h.recordLateAck(lostRecord{pn: pn, size: p.Length, sent: p.SendTime})
+			}
 			h.removeFromBytesInFlight(p)
 			if p.IsAckEliciting() {
 				h.queueFramesForRetransmission(p)
@@ -1210,6 +1508,20 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 	for pn := range h.appDataPackets.history.PathProbes() {
 		h.appDataPackets.history.RemovePathProbe(pn)
 	}
+	if ps != nil {
+		// A PathSender is kept across a migration. The connection tells it
+		// the old and new addresses once it has recorded them.
+		ps.OnDiscarded(now, congestionExt.ByteCount(h.bytesInFlight), h.discardRefs, true, congestionExt.DiscardMigration)
+		clear(h.discardRefs)
+		h.discardRefs = h.discardRefs[:0]
+		h.permit = congestionExt.Permit{}
+		// Path MTU discovery starts again on the new path.
+		h.maxDatagramSize = initialMaxDatagramSize
+		ps.SetMaxDatagramSize(congestionExt.ByteCount(initialMaxDatagramSize))
+		h.setLossDetectionTimer(now)
+		return
+	}
+	h.congestionMutex.Lock()
 	h.congestion = congestion.NewCubicSender(
 		congestion.DefaultClock{},
 		h.rttStats,
@@ -1218,6 +1530,7 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 		true, // use Reno
 		h.qlogger,
 	)
+	h.congestionMutex.Unlock()
 	h.setLossDetectionTimer(now)
 }
 
@@ -1228,8 +1541,28 @@ func (h *sentPacketHandler) getCongestionControl() congestion.SendAlgorithmWithD
 	return cc
 }
 
+func (h *sentPacketHandler) getPathSender() congestionExt.PathSender {
+	h.congestionMutex.RLock()
+	ps := h.pathSender
+	h.congestionMutex.RUnlock()
+	return ps
+}
+
+func (h *sentPacketHandler) getControllers() (congestion.SendAlgorithmWithDebugInfos, congestionExt.PathSender) {
+	h.congestionMutex.RLock()
+	cc, ps := h.congestion, h.pathSender
+	h.congestionMutex.RUnlock()
+	return cc, ps
+}
+
+// SetCongestionControl installs a controller. A congestion.PathSender must be
+// installed with InstallPathSender, on the run loop; passed here it is driven
+// through the per-packet callbacks like any other controller. Replacing a
+// PathSender detaches it, and must then happen on the run loop too.
 func (h *sentPacketHandler) SetCongestionControl(cc congestionExt.CongestionControl) {
 	h.congestionMutex.Lock()
+	old := h.pathSender
+	h.pathSender = nil
 	cc.SetRTTStatsProvider(h.rttStats)
 	if ccEx, isEx := cc.(congestionExt.CongestionControlEx); isEx {
 		h.congestion = &ccAdapterEx{ccEx}
@@ -1237,4 +1570,188 @@ func (h *sentPacketHandler) SetCongestionControl(cc congestionExt.CongestionCont
 		h.congestion = &ccAdapter{cc}
 	}
 	h.congestionMutex.Unlock()
+	if old != nil {
+		// Replacing a PathSender happens on the run loop.
+		h.permit = congestionExt.Permit{}
+		h.controllerGen++
+		old.OnDetach(monotime.Now())
+	}
+}
+
+// InstallPathSender installs a PathSender. It must be called on the run loop.
+// OnAttach is the controller's first call and carries the current flight.
+func (h *sentPacketHandler) InstallPathSender(ps congestionExt.PathSender, now monotime.Time, wake func()) {
+	h.congestionMutex.RLock()
+	old := h.pathSender
+	h.congestionMutex.RUnlock()
+	if old != nil {
+		old.OnDetach(now)
+	}
+	// OnAttach is the new controller's first call.
+	ps.OnAttach(now, congestionExt.ByteCount(h.bytesInFlight), congestionExt.ByteCount(h.maxDatagramSize), wake)
+	ps.SetRTTStatsProvider(h.rttStats)
+	h.congestionMutex.Lock()
+	h.congestion = &ccAdapter{ps}
+	h.pathSender = ps
+	h.permit = congestionExt.Permit{}
+	h.controllerGen++
+	h.congestionMutex.Unlock()
+}
+
+// DetachPathSender tells an installed PathSender that the connection is gone.
+func (h *sentPacketHandler) DetachPathSender(now monotime.Time) {
+	h.congestionMutex.Lock()
+	ps := h.pathSender
+	h.pathSender = nil
+	h.congestionMutex.Unlock()
+	if ps != nil {
+		ps.OnDetach(now)
+	}
+}
+
+// AdmissionRefused says the last SendMode refused because the PathSender
+// refused admission. A transport limit (the outstanding-packet limit) is not
+// an admission refusal, and grants the exempt path no more than an ACK.
+func (h *sentPacketHandler) AdmissionRefused() bool { return h.admissionRefused }
+
+// ExpectGrantedPacket says the next packet was built under a verification
+// grant.
+func (h *sentPacketHandler) ExpectGrantedPacket(id uint64) { h.grantPending = id }
+
+// ExpectAckLength says how long the next packet's ACK frame is.
+func (h *sentPacketHandler) ExpectAckLength(n protocol.ByteCount) { h.ackLenPending = n }
+
+// BytesInFlight returns the connection's bytes in flight.
+func (h *sentPacketHandler) BytesInFlight() protocol.ByteCount { return h.bytesInFlight }
+
+func spaceOf(encLevel protocol.EncryptionLevel) congestionExt.PacketSpace {
+	switch encLevel {
+	case protocol.EncryptionInitial:
+		return congestionExt.SpaceInitial
+	case protocol.EncryptionHandshake:
+		return congestionExt.SpaceHandshake
+	default:
+		return congestionExt.SpaceApplication
+	}
+}
+
+func packetRef(encLevel protocol.EncryptionLevel, pn protocol.PacketNumber, size protocol.ByteCount) congestionExt.PacketRef {
+	return congestionExt.PacketRef{Space: spaceOf(encLevel), Number: congestionExt.PacketNumber(pn), Bytes: congestionExt.ByteCount(size)}
+}
+
+// lostRefs converts the packets detectLostPackets just declared lost.
+func (h *sentPacketHandler) lostRefs(encLevel protocol.EncryptionLevel) []congestionExt.PacketRef {
+	if len(h.lostPacketsInfo) == 0 {
+		return nil
+	}
+	refs := make([]congestionExt.PacketRef, len(h.lostPacketsInfo))
+	for i, l := range h.lostPacketsInfo {
+		refs[i] = congestionExt.PacketRef{Space: spaceOf(encLevel), Number: l.PacketNumber, Bytes: l.BytesLost}
+	}
+	return refs
+}
+
+// packetKind labels a packet from what was actually assembled.
+func (h *sentPacketHandler) packetKind(encLevel protocol.EncryptionLevel, p *packet, ackEliciting, ptoProbe bool) congestionExt.PacketKind {
+	switch {
+	case encLevel == protocol.EncryptionInitial || encLevel == protocol.EncryptionHandshake:
+		return congestionExt.KindHandshake
+	case p.IsPathMTUProbePacket:
+		return congestionExt.KindMTUProbe
+	case !ackEliciting:
+		return congestionExt.KindAckOnly
+	case ptoProbe:
+		return congestionExt.KindPTOProbe
+	}
+	if len(p.StreamFrames) > 0 {
+		return congestionExt.KindOrdinary
+	}
+	onlyPing, pathValidation, liveness := true, false, false
+	for _, f := range p.Frames {
+		switch f.Frame.(type) {
+		case *wire.PingFrame:
+			// The keep-alive PING is recognised by its own marker, not by
+			// what was queued, so an unrelated PING is never mistaken for it.
+			liveness = liveness || isLivenessPing(f)
+		case *wire.PathChallengeFrame, *wire.PathResponseFrame:
+			pathValidation = true
+		default:
+			onlyPing = false
+		}
+	}
+	if !onlyPing {
+		return congestionExt.KindOrdinary
+	}
+	if liveness {
+		return congestionExt.KindLiveness
+	}
+	if pathValidation {
+		// A packet of path validation frames (and perhaps a PING) built
+		// on the current path. Unlike a probe packet it is in flight.
+		return congestionExt.KindPathProbe
+	}
+	if p.LargestAcked != protocol.InvalidPacketNumber {
+		return congestionExt.KindAckPing
+	}
+	return congestionExt.KindOrdinary
+}
+
+// sentPacketInfo describes a registered packet. Without class tags, bytes are
+// classed by frame type: stream data is BULK, DATAGRAM frames INTERACTIVE,
+// ACK, PING and path validation EXEMPT, anything else CONTROL. Packet
+// overhead is charged to the first non-exempt class the packet carries.
+func (h *sentPacketHandler) sentPacketInfo(t monotime.Time, encLevel protocol.EncryptionLevel, pn protocol.PacketNumber, p *packet, kind congestionExt.PacketKind, exempt bool, ackLen protocol.ByteCount) congestionExt.SentPacket {
+	info := congestionExt.SentPacket{
+		Space:           spaceOf(encLevel),
+		Number:          congestionExt.PacketNumber(pn),
+		Bytes:           congestionExt.ByteCount(p.Length),
+		AckEliciting:    p.IsAckEliciting(),
+		InFlightCounted: p.includedInBytesInFlight,
+		Exempt:          exempt, // the build path actually used
+		Kind:            kind,
+		InFlight:        congestionExt.ByteCount(h.bytesInFlight),
+		Time:            t,
+	}
+	// The ACK frame is exempt.
+	framed := min(ackLen, p.Length)
+	info.ClassBytes[congestionExt.ClassExempt] += congestionExt.ByteCount(framed)
+	for _, f := range p.StreamFrames {
+		n := f.Frame.Length(protocol.Version1)
+		info.ClassBytes[congestionExt.ClassBulk] += congestionExt.ByteCount(n)
+		framed += n
+	}
+	for _, f := range p.Frames {
+		n := f.Frame.Length(protocol.Version1)
+		framed += n
+		switch f.Frame.(type) {
+		case *wire.DatagramFrame:
+			info.HasDatagram = true
+			info.ClassBytes[congestionExt.ClassInteractive] += congestionExt.ByteCount(n)
+		case *wire.PingFrame, *wire.PathChallengeFrame, *wire.PathResponseFrame:
+			info.ClassBytes[congestionExt.ClassExempt] += congestionExt.ByteCount(n)
+		default:
+			info.ClassBytes[congestionExt.ClassControl] += congestionExt.ByteCount(n)
+		}
+	}
+	if framed < p.Length {
+		overhead := congestionExt.ByteCount(p.Length - framed)
+		class := congestionExt.ClassExempt
+		for _, c := range []congestionExt.SendClass{congestionExt.ClassControl, congestionExt.ClassInteractive, congestionExt.ClassBulk} {
+			if info.ClassBytes[c] > 0 {
+				class = c
+				break
+			}
+		}
+		info.ClassBytes[class] += overhead
+	}
+	return info
+}
+
+// publishProgress publishes the transport progress snapshot when it changed.
+func (h *sentPacketHandler) publishProgress() {
+	h.progress.ElicitingOutstanding = h.appInFlight > 0
+	if h.progress != h.published {
+		h.published = h.progress
+		h.connStats.SetProgress(h.progress)
+	}
 }

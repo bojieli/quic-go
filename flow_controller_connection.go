@@ -135,6 +135,13 @@ func (c *connectionFlowController) IsNewlyBlocked() (bool, protocol.ByteCount) {
 	return true, c.sendWindow
 }
 
+// HasWindowUpdate says whether a MAX_DATA frame is due. It does not consume it.
+func (c *connectionFlowController) HasWindowUpdate() bool {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	return c.hasWindowUpdate()
+}
+
 func (c *connectionFlowController) GetWindowUpdate(now monotime.Time) protocol.ByteCount {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()

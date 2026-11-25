@@ -42,4 +42,21 @@ type SentPacketHandler interface {
 	MigratedPath(now monotime.Time, initialMaxPacketSize protocol.ByteCount)
 
 	SetCongestionControl(congestion.CongestionControl)
+
+	// InstallPathSender installs a congestion.PathSender. It must be called on
+	// the run loop.
+	InstallPathSender(ps congestion.PathSender, now monotime.Time, wake func())
+	// DetachPathSender detaches an installed PathSender.
+	DetachPathSender(now monotime.Time)
+	// AdmissionRefused says the last SendMode refused because the PathSender
+	// refused admission, not because of a transport limit.
+	AdmissionRefused() bool
+	// ExpectGrantedPacket says the next packet registered was built under the
+	// verification grant with this ID.
+	ExpectGrantedPacket(id uint64)
+	// ExpectAckLength says how many bytes of the next packet registered are
+	// its ACK frame, which is not among the frames SentPacket receives.
+	ExpectAckLength(n protocol.ByteCount)
+	// BytesInFlight returns the connection's bytes in flight.
+	BytesInFlight() protocol.ByteCount
 }

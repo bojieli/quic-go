@@ -36,8 +36,11 @@ type framer struct {
 	streamQueue              ringbuffer.RingBuffer[protocol.StreamID]
 	streamsWithControlFrames map[protocol.StreamID]streamControlFrameGetter
 
-	controlFrameMutex          sync.Mutex
-	controlFrames              []wire.Frame
+	controlFrameMutex sync.Mutex
+	controlFrames     []wire.Frame
+	// exemptFrames are obligations that may be sent without a permit, such
+	// as a liveness PING. They are also packed into ordinary packets.
+	exemptFrames               []ackhandler.Frame
 	pathResponses              []*wire.PathResponseFrame
 	connFlowController         *connectionFlowController
 	queuedTooManyControlFrames bool
@@ -60,7 +63,83 @@ func (f *framer) HasData() bool {
 	}
 	f.controlFrameMutex.Lock()
 	defer f.controlFrameMutex.Unlock()
-	return len(f.streamsWithControlFrames) > 0 || len(f.controlFrames) > 0 || len(f.pathResponses) > 0
+	return len(f.streamsWithControlFrames) > 0 || len(f.controlFrames) > 0 || len(f.pathResponses) > 0 || len(f.exemptFrames) > 0
+}
+
+// QueueExemptFrame queues a frame that may be sent without a permit. Its
+// handler, if any, is kept.
+func (f *framer) QueueExemptFrame(frame ackhandler.Frame) {
+	f.controlFrameMutex.Lock()
+	defer f.controlFrameMutex.Unlock()
+	if len(f.exemptFrames) >= maxPathResponses {
+		return
+	}
+	f.exemptFrames = append(f.exemptFrames, frame)
+}
+
+// HasExemptData says whether exempt obligations are queued.
+func (f *framer) HasExemptData() bool {
+	f.controlFrameMutex.Lock()
+	defer f.controlFrameMutex.Unlock()
+	return len(f.pathResponses) > 0 || len(f.exemptFrames) > 0
+}
+
+// HasControlData says whether control frames other than exempt ones are
+// queued. It does not consume them.
+func (f *framer) HasControlData() bool {
+	f.controlFrameMutex.Lock()
+	defer f.controlFrameMutex.Unlock()
+	return len(f.streamsWithControlFrames) > 0 || len(f.controlFrames) > 0
+}
+
+// HasStreamData says whether a queued stream could send a frame now. It
+// consumes nothing; a stream that cannot say is assumed able to.
+func (f *framer) HasStreamData(connWindow bool) bool {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	if f.streamQueue.Empty() {
+		return false
+	}
+	for _, str := range f.activeStreams {
+		s, ok := str.(interface{ hasSendableData(bool) bool })
+		if !ok || s.hasSendableData(connWindow) {
+			return true
+		}
+	}
+	return false
+}
+
+// AppendExempt appends only exempt obligations: one PATH_RESPONSE and the
+// queued exempt frames.
+func (f *framer) AppendExempt(frames []ackhandler.Frame, maxLen protocol.ByteCount, v protocol.Version) ([]ackhandler.Frame, protocol.ByteCount) {
+	f.controlFrameMutex.Lock()
+	defer f.controlFrameMutex.Unlock()
+	return f.appendExemptFrames(frames, maxLen, v)
+}
+
+func (f *framer) appendExemptFrames(frames []ackhandler.Frame, maxLen protocol.ByteCount, v protocol.Version) ([]ackhandler.Frame, protocol.ByteCount) {
+	var length protocol.ByteCount
+	// only pack a single PATH_RESPONSE per packet
+	if len(f.pathResponses) > 0 {
+		frame := f.pathResponses[0]
+		frameLen := frame.Length(v)
+		if frameLen <= maxLen {
+			frames = append(frames, ackhandler.Frame{Frame: frame})
+			length += frameLen
+			f.pathResponses = f.pathResponses[1:]
+		}
+	}
+	for len(f.exemptFrames) > 0 {
+		frame := f.exemptFrames[len(f.exemptFrames)-1]
+		frameLen := frame.Frame.Length(v)
+		if length+frameLen > maxLen {
+			break
+		}
+		frames = append(frames, frame)
+		length += frameLen
+		f.exemptFrames = f.exemptFrames[:len(f.exemptFrames)-1]
+	}
+	return frames, length
 }
 
 func (f *framer) QueueControlFrame(frame wire.Frame) {
@@ -159,17 +238,8 @@ func (f *framer) appendControlFrames(
 	now monotime.Time,
 	v protocol.Version,
 ) ([]ackhandler.Frame, protocol.ByteCount) {
-	var length protocol.ByteCount
 	// add a PATH_RESPONSE first, but only pack a single PATH_RESPONSE per packet
-	if len(f.pathResponses) > 0 {
-		frame := f.pathResponses[0]
-		frameLen := frame.Length(v)
-		if frameLen <= maxLen {
-			frames = append(frames, ackhandler.Frame{Frame: frame})
-			length += frameLen
-			f.pathResponses = f.pathResponses[1:]
-		}
-	}
+	frames, length := f.appendExemptFrames(frames, maxLen, v)
 
 	// add stream-related control frames
 	for id, str := range f.streamsWithControlFrames {

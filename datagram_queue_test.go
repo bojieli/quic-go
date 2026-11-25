@@ -178,3 +178,26 @@ func TestDatagramQueueClose(t *testing.T) {
 		}
 	})
 }
+
+// Every accepted tagged datagram gets exactly one terminal outcome: it is
+// registered, or it is returned by CloseWithError -- still queued, or popped
+// for a packet that was never registered. After closing, a tagged datagram is
+// refused.
+func TestDatagramQueueTaggedLifecycle(t *testing.T) {
+	queue := newDatagramQueue(func() {}, utils.DefaultLogger)
+	sent := &wire.DatagramFrame{Data: []byte("a"), Tagged: true, Tag: 1}
+	popped := &wire.DatagramFrame{Data: []byte("b"), Tagged: true, Tag: 2}
+	queued := &wire.DatagramFrame{Data: []byte("c"), Tagged: true, Tag: 3}
+	untagged := &wire.DatagramFrame{Data: []byte("d")}
+	for _, f := range []*wire.DatagramFrame{sent, popped, queued, untagged} {
+		require.NoError(t, queue.Add(f))
+	}
+	queue.Pop()
+	require.True(t, queue.Registered(sent))
+	require.False(t, queue.Registered(sent), "registered once")
+	queue.Pop() // popped; its packet build fails before registration
+	unsent := queue.CloseWithError(assert.AnError)
+	require.ElementsMatch(t, []*wire.DatagramFrame{popped, queued}, unsent)
+	require.ErrorIs(t, queue.Add(&wire.DatagramFrame{Data: []byte("e"), Tagged: true, Tag: 4}), assert.AnError)
+	require.False(t, queue.hasPopped())
+}

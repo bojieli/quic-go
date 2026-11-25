@@ -82,6 +82,45 @@ func (c *MockFrameSourceAppendCall) DoAndReturn(f func([]ackhandler.Frame, []ack
 	return c
 }
 
+// AppendExempt mocks base method.
+func (m *MockFrameSource) AppendExempt(arg0 []ackhandler.Frame, arg1 protocol.ByteCount, arg2 protocol.Version) ([]ackhandler.Frame, protocol.ByteCount) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "AppendExempt", arg0, arg1, arg2)
+	ret0, _ := ret[0].([]ackhandler.Frame)
+	ret1, _ := ret[1].(protocol.ByteCount)
+	return ret0, ret1
+}
+
+// AppendExempt indicates an expected call of AppendExempt.
+func (mr *MockFrameSourceMockRecorder) AppendExempt(arg0, arg1, arg2 any) *MockFrameSourceAppendExemptCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AppendExempt", reflect.TypeOf((*MockFrameSource)(nil).AppendExempt), arg0, arg1, arg2)
+	return &MockFrameSourceAppendExemptCall{Call: call}
+}
+
+// MockFrameSourceAppendExemptCall wrap *gomock.Call
+type MockFrameSourceAppendExemptCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockFrameSourceAppendExemptCall) Return(arg0 []ackhandler.Frame, arg1 protocol.ByteCount) *MockFrameSourceAppendExemptCall {
+	c.Call = c.Call.Return(arg0, arg1)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockFrameSourceAppendExemptCall) Do(f func([]ackhandler.Frame, protocol.ByteCount, protocol.Version) ([]ackhandler.Frame, protocol.ByteCount)) *MockFrameSourceAppendExemptCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockFrameSourceAppendExemptCall) DoAndReturn(f func([]ackhandler.Frame, protocol.ByteCount, protocol.Version) ([]ackhandler.Frame, protocol.ByteCount)) *MockFrameSourceAppendExemptCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
 // HasData mocks base method.
 func (m *MockFrameSource) HasData() bool {
 	m.ctrl.T.Helper()
@@ -116,6 +155,44 @@ func (c *MockFrameSourceHasDataCall) Do(f func() bool) *MockFrameSourceHasDataCa
 
 // DoAndReturn rewrite *gomock.Call.DoAndReturn
 func (c *MockFrameSourceHasDataCall) DoAndReturn(f func() bool) *MockFrameSourceHasDataCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
+// HasExemptData mocks base method.
+func (m *MockFrameSource) HasExemptData() bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "HasExemptData")
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// HasExemptData indicates an expected call of HasExemptData.
+func (mr *MockFrameSourceMockRecorder) HasExemptData() *MockFrameSourceHasExemptDataCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "HasExemptData", reflect.TypeOf((*MockFrameSource)(nil).HasExemptData))
+	return &MockFrameSourceHasExemptDataCall{Call: call}
+}
+
+// MockFrameSourceHasExemptDataCall wrap *gomock.Call
+type MockFrameSourceHasExemptDataCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockFrameSourceHasExemptDataCall) Return(arg0 bool) *MockFrameSourceHasExemptDataCall {
+	c.Call = c.Call.Return(arg0)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockFrameSourceHasExemptDataCall) Do(f func() bool) *MockFrameSourceHasExemptDataCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockFrameSourceHasExemptDataCall) DoAndReturn(f func() bool) *MockFrameSourceHasExemptDataCall {
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }

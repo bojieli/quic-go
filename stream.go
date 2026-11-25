@@ -251,3 +251,11 @@ func (s *Stream) checkIfCompleted() {
 		s.sender.onStreamCompleted(s.StreamID())
 	}
 }
+
+// grantSendStream makes a Stream a GrantableStream.
+func (s *Stream) grantSendStream() *SendStream {
+	if s == nil {
+		return nil
+	}
+	return s.sendStr
+}

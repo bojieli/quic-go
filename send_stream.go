@@ -3,6 +3,7 @@ package quic
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/apernet/quic-go/internal/monotime"
 	"github.com/apernet/quic-go/internal/protocol"
 	"github.com/apernet/quic-go/internal/wire"
+	"github.com/apernet/quic-go/quicvarint"
 )
 
 // A SendStream is a unidirectional Send Stream.
@@ -341,11 +343,8 @@ func (s *SendStream) popStreamFrame(maxBytes protocol.ByteCount, v protocol.Vers
 	if f != nil {
 		s.numOutstandingFrames++
 	}
+	s.capturePrefix(f)
 	if repair := s.prefixRepair; repair != nil {
-		if f != nil && f.Offset == 0 && len(f.Data) > 0 && repair.data == nil {
-			// Capture only bytes the normal framer already charged to flow control.
-			repair.data = append([]byte(nil), f.Data[:min(repair.limit, len(f.Data))]...)
-		}
 		if len(repair.data) > 0 {
 			if f == nil {
 				// One visit per stream per packet. The regular packetizer and
@@ -514,6 +513,137 @@ func (s *SendStream) popNewStreamFrame(maxDataLen protocol.ByteCount) (_ *wire.S
 	s.getDataForWriting(f, maxDataLen)
 	return f, s.dataForWriting != nil || s.nextFrame != nil || s.finishedWriting
 }
+
+// AcceptedOffset is the stream offset of the next byte a write will accept:
+// every byte before it has been accepted by the stream.
+func (s *SendStream) AcceptedOffset() protocol.ByteCount {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	// The unconsumed tail of a blocking Write is not accepted yet: the write
+	// may still time out and return short.
+	n := s.writeOffset
+	if s.nextFrame != nil {
+		n += s.nextFrame.DataLen()
+	}
+	return n
+}
+
+// popGrantedStreamFrame pops a frame that carries only bytes of [start, end):
+// a queued retransmission inside the range first, then new data at the write
+// offset. It is the verification grant's build path.
+func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCount, v protocol.Version) (ackhandler.StreamFrame, *wire.StreamDataBlockedFrame) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if s.shutdownErr != nil || (s.resetErr != nil && s.reliableOffset() == 0) {
+		// A reliable reset still owes the bytes below its reliable offset;
+		// the pop routines below respect that offset.
+		return ackhandler.StreamFrame{}, nil
+	}
+	// limit is the frame size that carries the range's remaining bytes from
+	// offset, with the length field sized for that many bytes.
+	limit := func(offset protocol.ByteCount) protocol.ByteCount {
+		n := end - offset
+		header := (&wire.StreamFrame{StreamID: s.streamID, Offset: offset, DataLenPresent: true}).Length(v) - 1 // without the length field
+		return min(maxBytes, header+protocol.ByteCount(quicvarint.Len(uint64(n)))+n)
+	}
+	for i, f := range s.retransmissionQueue {
+		if f.DataLen() == 0 || f.Offset >= end || f.Offset+f.DataLen() <= start {
+			// A FIN-only frame carries no granted byte.
+			continue
+		}
+		if f.Offset < start {
+			// Split at the grant's start: the uncovered front stays queued
+			// for ordinary admission.
+			tail := &wire.StreamFrame{
+				StreamID:       f.StreamID,
+				Offset:         start,
+				DataLenPresent: true,
+				Fin:            f.Fin,
+				Data:           append([]byte(nil), f.Data[start-f.Offset:]...),
+			}
+			f.Data = f.Data[:start-f.Offset]
+			f.Fin = false
+			s.retransmissionQueue = slices.Insert(s.retransmissionQueue, i+1, tail)
+			f, i = tail, i+1
+		}
+		size := limit(f.Offset)
+		newFrame, needsSplit := f.MaybeSplitOffFrame(size, v)
+		if needsSplit {
+			if newFrame == nil {
+				return ackhandler.StreamFrame{}, nil
+			}
+			s.numOutstandingFrames++
+			return ackhandler.StreamFrame{Frame: newFrame, Handler: (*sendStreamAckHandler)(s)}, nil
+		}
+		s.retransmissionQueue = slices.Delete(s.retransmissionQueue, i, i+1)
+		s.numOutstandingFrames++
+		return ackhandler.StreamFrame{Frame: f, Handler: (*sendStreamAckHandler)(s)}, nil
+	}
+	if s.writeOffset < start || s.writeOffset >= end {
+		return ackhandler.StreamFrame{}, nil
+	}
+	if len(s.dataForWriting) == 0 && s.nextFrame == nil {
+		// Only a FIN could go: it carries no granted byte, so it is left to
+		// the ordinary builder.
+		return ackhandler.StreamFrame{}, nil
+	}
+	// New data only: retransmissions outside the range stay queued.
+	queued := s.retransmissionQueue
+	s.retransmissionQueue = nil
+	f, blocked, _ := s.popNewOrRetransmittedStreamFrame(limit(s.writeOffset), v)
+	s.retransmissionQueue = queued
+	if f == nil {
+		return ackhandler.StreamFrame{}, blocked
+	}
+	// The prefix-repair capture happens here as on the ordinary path; its
+	// redundant copies are offered only by the ordinary builder.
+	s.capturePrefix(f)
+	s.numOutstandingFrames++
+	return ackhandler.StreamFrame{Frame: f, Handler: (*sendStreamAckHandler)(s)}, blocked
+}
+
+// hasSendableData says, without consuming anything, whether a frame could be
+// popped now: a retransmission, reserved bytes, a FIN, or new bytes the
+// stream's flow control allows (connWindow says whether the connection's
+// does).
+func (s *SendStream) hasSendableData(connWindow bool) bool {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if s.shutdownErr != nil {
+		return false
+	}
+	if len(s.retransmissionQueue) > 0 || s.nextFrameReserved {
+		return true
+	}
+	if s.prefixRepair != nil && len(s.prefixRepair.data) > 0 {
+		return true // a captured prefix copy
+	}
+	if s.resetErr != nil {
+		// Only the reliable prefix is still owed.
+		if reliable := s.reliableOffset(); reliable == 0 || s.writeOffset >= reliable {
+			return false
+		}
+	}
+	if s.writeLimited {
+		return false
+	}
+	if len(s.dataForWriting) == 0 && s.nextFrame == nil {
+		return s.finishedWriting && !s.finSent
+	}
+	return connWindow && s.flowController.SendWindowSize() > 0
+}
+
+// capturePrefix keeps a copy of the stream's first frame for
+// ProtectInitialPrefix. It must be called with the mutex held.
+func (s *SendStream) capturePrefix(f *wire.StreamFrame) {
+	if repair := s.prefixRepair; repair != nil && f != nil && f.Offset == 0 && len(f.Data) > 0 && repair.data == nil {
+		// Capture only bytes the normal framer already charged to flow control.
+		repair.data = append([]byte(nil), f.Data[:min(repair.limit, len(f.Data))]...)
+	}
+}
+
+// grantSendStream makes a SendStream a GrantableStream.
+func (s *SendStream) grantSendStream() *SendStream { return s }
 
 func (s *SendStream) maybeGetRetransmission(maxBytes protocol.ByteCount, v protocol.Version) (*wire.StreamFrame, bool /* has more retransmissions */) {
 	f := s.retransmissionQueue[0]

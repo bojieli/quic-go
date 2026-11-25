@@ -77,6 +77,16 @@ func (h *ReceivedPacketHandler) DropPackets(encLevel protocol.EncryptionLevel) {
 	}
 }
 
+// HasAckDue says, without consuming anything, whether an application-data ACK
+// is queued or its timer has expired.
+func (h *ReceivedPacketHandler) HasAckDue(now monotime.Time) bool {
+	t := &h.appDataPackets
+	if t.ackQueued {
+		return true
+	}
+	return !t.ackAlarm.IsZero() && !t.ackAlarm.After(now)
+}
+
 func (h *ReceivedPacketHandler) GetAlarmTimeout() monotime.Time {
 	return h.appDataPackets.GetAlarmTimeout()
 }

@@ -44,6 +44,118 @@ func (m *MockSentPacketHandler) EXPECT() *MockSentPacketHandlerMockRecorder {
 	return m.recorder
 }
 
+// AdmissionRefused mocks base method.
+func (m *MockSentPacketHandler) AdmissionRefused() bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "AdmissionRefused")
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// AdmissionRefused indicates an expected call of AdmissionRefused.
+func (mr *MockSentPacketHandlerMockRecorder) AdmissionRefused() *MockSentPacketHandlerAdmissionRefusedCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AdmissionRefused", reflect.TypeOf((*MockSentPacketHandler)(nil).AdmissionRefused))
+	return &MockSentPacketHandlerAdmissionRefusedCall{Call: call}
+}
+
+// MockSentPacketHandlerAdmissionRefusedCall wrap *gomock.Call
+type MockSentPacketHandlerAdmissionRefusedCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockSentPacketHandlerAdmissionRefusedCall) Return(arg0 bool) *MockSentPacketHandlerAdmissionRefusedCall {
+	c.Call = c.Call.Return(arg0)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockSentPacketHandlerAdmissionRefusedCall) Do(f func() bool) *MockSentPacketHandlerAdmissionRefusedCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockSentPacketHandlerAdmissionRefusedCall) DoAndReturn(f func() bool) *MockSentPacketHandlerAdmissionRefusedCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
+// BytesInFlight mocks base method.
+func (m *MockSentPacketHandler) BytesInFlight() protocol.ByteCount {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "BytesInFlight")
+	ret0, _ := ret[0].(protocol.ByteCount)
+	return ret0
+}
+
+// BytesInFlight indicates an expected call of BytesInFlight.
+func (mr *MockSentPacketHandlerMockRecorder) BytesInFlight() *MockSentPacketHandlerBytesInFlightCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "BytesInFlight", reflect.TypeOf((*MockSentPacketHandler)(nil).BytesInFlight))
+	return &MockSentPacketHandlerBytesInFlightCall{Call: call}
+}
+
+// MockSentPacketHandlerBytesInFlightCall wrap *gomock.Call
+type MockSentPacketHandlerBytesInFlightCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockSentPacketHandlerBytesInFlightCall) Return(arg0 protocol.ByteCount) *MockSentPacketHandlerBytesInFlightCall {
+	c.Call = c.Call.Return(arg0)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockSentPacketHandlerBytesInFlightCall) Do(f func() protocol.ByteCount) *MockSentPacketHandlerBytesInFlightCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockSentPacketHandlerBytesInFlightCall) DoAndReturn(f func() protocol.ByteCount) *MockSentPacketHandlerBytesInFlightCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
+// DetachPathSender mocks base method.
+func (m *MockSentPacketHandler) DetachPathSender(now monotime.Time) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "DetachPathSender", now)
+}
+
+// DetachPathSender indicates an expected call of DetachPathSender.
+func (mr *MockSentPacketHandlerMockRecorder) DetachPathSender(now any) *MockSentPacketHandlerDetachPathSenderCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DetachPathSender", reflect.TypeOf((*MockSentPacketHandler)(nil).DetachPathSender), now)
+	return &MockSentPacketHandlerDetachPathSenderCall{Call: call}
+}
+
+// MockSentPacketHandlerDetachPathSenderCall wrap *gomock.Call
+type MockSentPacketHandlerDetachPathSenderCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockSentPacketHandlerDetachPathSenderCall) Return() *MockSentPacketHandlerDetachPathSenderCall {
+	c.Call = c.Call.Return()
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockSentPacketHandlerDetachPathSenderCall) Do(f func(monotime.Time)) *MockSentPacketHandlerDetachPathSenderCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockSentPacketHandlerDetachPathSenderCall) DoAndReturn(f func(monotime.Time)) *MockSentPacketHandlerDetachPathSenderCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
 // DropPackets mocks base method.
 func (m *MockSentPacketHandler) DropPackets(arg0 protocol.EncryptionLevel, rcvTime monotime.Time) {
 	m.ctrl.T.Helper()
@@ -118,6 +230,78 @@ func (c *MockSentPacketHandlerECNModeCall) DoAndReturn(f func(bool) protocol.ECN
 	return c
 }
 
+// ExpectAckLength mocks base method.
+func (m *MockSentPacketHandler) ExpectAckLength(n protocol.ByteCount) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "ExpectAckLength", n)
+}
+
+// ExpectAckLength indicates an expected call of ExpectAckLength.
+func (mr *MockSentPacketHandlerMockRecorder) ExpectAckLength(n any) *MockSentPacketHandlerExpectAckLengthCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ExpectAckLength", reflect.TypeOf((*MockSentPacketHandler)(nil).ExpectAckLength), n)
+	return &MockSentPacketHandlerExpectAckLengthCall{Call: call}
+}
+
+// MockSentPacketHandlerExpectAckLengthCall wrap *gomock.Call
+type MockSentPacketHandlerExpectAckLengthCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockSentPacketHandlerExpectAckLengthCall) Return() *MockSentPacketHandlerExpectAckLengthCall {
+	c.Call = c.Call.Return()
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockSentPacketHandlerExpectAckLengthCall) Do(f func(protocol.ByteCount)) *MockSentPacketHandlerExpectAckLengthCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockSentPacketHandlerExpectAckLengthCall) DoAndReturn(f func(protocol.ByteCount)) *MockSentPacketHandlerExpectAckLengthCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
+// ExpectGrantedPacket mocks base method.
+func (m *MockSentPacketHandler) ExpectGrantedPacket(id uint64) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "ExpectGrantedPacket", id)
+}
+
+// ExpectGrantedPacket indicates an expected call of ExpectGrantedPacket.
+func (mr *MockSentPacketHandlerMockRecorder) ExpectGrantedPacket(id any) *MockSentPacketHandlerExpectGrantedPacketCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ExpectGrantedPacket", reflect.TypeOf((*MockSentPacketHandler)(nil).ExpectGrantedPacket), id)
+	return &MockSentPacketHandlerExpectGrantedPacketCall{Call: call}
+}
+
+// MockSentPacketHandlerExpectGrantedPacketCall wrap *gomock.Call
+type MockSentPacketHandlerExpectGrantedPacketCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockSentPacketHandlerExpectGrantedPacketCall) Return() *MockSentPacketHandlerExpectGrantedPacketCall {
+	c.Call = c.Call.Return()
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockSentPacketHandlerExpectGrantedPacketCall) Do(f func(uint64)) *MockSentPacketHandlerExpectGrantedPacketCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockSentPacketHandlerExpectGrantedPacketCall) DoAndReturn(f func(uint64)) *MockSentPacketHandlerExpectGrantedPacketCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
 // GetLossDetectionTimeout mocks base method.
 func (m *MockSentPacketHandler) GetLossDetectionTimeout() monotime.Time {
 	m.ctrl.T.Helper()
@@ -152,6 +336,42 @@ func (c *MockSentPacketHandlerGetLossDetectionTimeoutCall) Do(f func() monotime.
 
 // DoAndReturn rewrite *gomock.Call.DoAndReturn
 func (c *MockSentPacketHandlerGetLossDetectionTimeoutCall) DoAndReturn(f func() monotime.Time) *MockSentPacketHandlerGetLossDetectionTimeoutCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
+// InstallPathSender mocks base method.
+func (m *MockSentPacketHandler) InstallPathSender(ps congestion.PathSender, now monotime.Time, wake func()) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "InstallPathSender", ps, now, wake)
+}
+
+// InstallPathSender indicates an expected call of InstallPathSender.
+func (mr *MockSentPacketHandlerMockRecorder) InstallPathSender(ps, now, wake any) *MockSentPacketHandlerInstallPathSenderCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "InstallPathSender", reflect.TypeOf((*MockSentPacketHandler)(nil).InstallPathSender), ps, now, wake)
+	return &MockSentPacketHandlerInstallPathSenderCall{Call: call}
+}
+
+// MockSentPacketHandlerInstallPathSenderCall wrap *gomock.Call
+type MockSentPacketHandlerInstallPathSenderCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockSentPacketHandlerInstallPathSenderCall) Return() *MockSentPacketHandlerInstallPathSenderCall {
+	c.Call = c.Call.Return()
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockSentPacketHandlerInstallPathSenderCall) Do(f func(congestion.PathSender, monotime.Time, func())) *MockSentPacketHandlerInstallPathSenderCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockSentPacketHandlerInstallPathSenderCall) DoAndReturn(f func(congestion.PathSender, monotime.Time, func())) *MockSentPacketHandlerInstallPathSenderCall {
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }
