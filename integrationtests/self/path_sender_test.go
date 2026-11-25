@@ -2,6 +2,7 @@ package self_test
 
 import (
 	"context"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -271,4 +272,29 @@ func TestTaggedDatagramOutcomes(t *testing.T) {
 		defer mu.Unlock()
 		return outcomes[7] == quic.DatagramRegistered
 	}, time.Second, time.Millisecond)
+}
+
+// Replacing a PathSender is done on the run loop: the controller is detached
+// and the connection goes on with the replacement.
+func TestReplacingAPathSender(t *testing.T) {
+	client, server := dialPathSenderPair(t, &quic.Config{})
+	g := &gatePathSender{}
+	installPathSender(t, client, g)
+	client.SetCongestionControl(blockedLegacyController{})
+	require.Eventually(t, func() bool {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		return g.detached
+	}, time.Second, time.Millisecond)
+	client.SetCongestionControl(&gatePathSender{})
+	str, err := server.OpenUniStream()
+	require.NoError(t, err)
+	_, err = str.Write([]byte("still working"))
+	require.NoError(t, err)
+	require.NoError(t, str.Close())
+	cstr, err := client.AcceptUniStream(context.Background())
+	require.NoError(t, err)
+	buf := make([]byte, 13)
+	_, err = io.ReadFull(cstr, buf)
+	require.NoError(t, err)
 }

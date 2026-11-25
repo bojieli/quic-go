@@ -248,14 +248,15 @@ func TestPathSenderGetsOneEventPerAck(t *testing.T) {
 	_, err = sph.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(pns[1], pns[4], pns[5], pns[6], pns[7], pns[8], pns[9], ackOnly)}, protocol.Encryption1RTT, now.Add(time.Millisecond))
 	require.NoError(t, err)
 	require.Len(t, ps.acks, 2)
-	require.Equal(t, []congestion.PacketRef{{Space: congestion.SpaceApplication, Number: congestion.PacketNumber(pns[1])}}, ps.lastAck().Spurious)
+	require.Equal(t, []congestion.PacketRef{{Space: congestion.SpaceApplication, Number: congestion.PacketNumber(pns[1]), Bytes: 1000}}, ps.lastAck().Spurious,
+		"a correction names exactly the reference that was reported lost")
 	require.Empty(t, ps.lastAck().Acked)
 	requireGauge(t, sph, ps)
 	ps.requireNoLegacyCalls(t)
 
 	p := sph.connStats.Progress()
-	require.Equal(t, uint64(6), p.Epoch, "each newly acknowledged ack-eliciting packet is progress")
-	require.Equal(t, now, p.Last)
+	require.Equal(t, uint64(7), p.Epoch, "each newly acknowledged ack-eliciting packet is progress, a corrected loss included")
+	require.Equal(t, now.Add(time.Millisecond), p.Last)
 	require.False(t, p.ElicitingOutstanding)
 }
 

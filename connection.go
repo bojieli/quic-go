@@ -226,12 +226,15 @@ type Conn struct {
 
 	// pendingPathSender is a PathSender waiting to be installed on the run
 	// loop. pathSender is the installed one, and is only used on the run loop.
-	pathSenderMx       sync.Mutex
-	pendingPathSender  congestion.PathSender
-	hasPendingInstall  atomic.Bool
-	pathSenderReplaced atomic.Bool
-	pathSender         congestion.PathSender
-	demand             congestion.Demand
+	// A controller that replaces an installed PathSender is also installed
+	// on the run loop, so the handler, the connection and the controllers'
+	// callbacks switch together.
+	pathSenderMx      sync.Mutex
+	pendingController congestion.CongestionControl
+	hasPendingInstall atomic.Bool
+	hasPathSender     atomic.Bool
+	pathSender        congestion.PathSender
+	demand            congestion.Demand
 
 	datagramObserver atomic.Pointer[func(tag uint64, outcome DatagramOutcome)]
 
@@ -788,6 +791,7 @@ runLoop:
 	if c.pathSender != nil {
 		c.sentPacketHandler.DetachPathSender(monotime.Now())
 		c.pathSender = nil
+		c.hasPathSender.Store(false)
 	}
 	closeErr := c.closeErr.Load()
 	c.cryptoStreamHandler.Close()
@@ -978,23 +982,27 @@ func (c *Conn) applyPendingSettings(now monotime.Time) {
 		c.keepAliveFloor = floor
 		c.keepAliveStep = 0
 	}
-	if c.pathSenderReplaced.Load() {
-		c.pathSenderReplaced.Store(false)
-		c.pathSender = nil
-	}
 	if !c.hasPendingInstall.Load() {
 		return
 	}
 	c.pathSenderMx.Lock()
-	ps := c.pendingPathSender
-	c.pendingPathSender = nil
+	cc := c.pendingController
+	c.pendingController = nil
 	c.hasPendingInstall.Store(false)
 	c.pathSenderMx.Unlock()
-	if ps == nil {
+	if cc == nil {
+		return
+	}
+	ps, ok := cc.(congestion.PathSender)
+	if !ok {
+		c.sentPacketHandler.SetCongestionControl(cc)
+		c.pathSender = nil
+		c.hasPathSender.Store(false)
 		return
 	}
 	c.sentPacketHandler.InstallPathSender(ps, now, c.scheduleSending)
 	c.pathSender = ps
+	c.hasPathSender.Store(true)
 	c.demand = congestion.Demand{}
 }
 
@@ -2730,8 +2738,17 @@ func (c *Conn) updateDemand() {
 		c.retransmissionQueue.HasData(protocol.Encryption1RTT) ||
 		c.connFlowController.HasWindowUpdate() ||
 		c.cryptoStreamManager.HasPostHandshakeData()
+	if !c.handshakeConfirmed {
+		d.Eligible[congestion.ClassControl] = d.Eligible[congestion.ClassControl] ||
+			(c.initialStream != nil && c.initialStream.HasData()) ||
+			(c.handshakeStream != nil && c.handshakeStream.HasData()) ||
+			c.retransmissionQueue.HasData(protocol.EncryptionInitial) ||
+			c.retransmissionQueue.HasData(protocol.EncryptionHandshake)
+	}
 	d.Eligible[congestion.ClassInteractive] = c.datagramQueue != nil && c.datagramQueue.Peek() != nil
-	d.Eligible[congestion.ClassBulk] = c.framer.HasStreamData() && c.connFlowController.SendWindowSize() > 0
+	// A queued stream is eligible: its bytes were reserved against flow
+	// control when they were accepted, and retransmissions and FIN need none.
+	d.Eligible[congestion.ClassBulk] = c.framer.HasStreamData()
 	if d != c.demand {
 		c.demand = d
 		c.pathSender.OnDemand(d)
@@ -2815,6 +2832,9 @@ func (c *Conn) sendPacketsWithoutGSO(now monotime.Time) error {
 		if c.sendQueue.WouldBlock() {
 			return nil
 		}
+		if c.pathSender != nil {
+			c.updateDemand()
+		}
 		sendMode := c.sentPacketHandler.SendMode(now)
 		if sendMode == ackhandler.SendPacingLimited {
 			c.resetPacingDeadline()
@@ -2854,6 +2874,9 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 		}
 
 		if !dontSendMore {
+			if c.pathSender != nil {
+				c.updateDemand()
+			}
 			sendMode := c.sentPacketHandler.SendMode(now)
 			if sendMode == ackhandler.SendPacingLimited {
 				c.resetPacingDeadline()
@@ -3461,21 +3484,19 @@ func estimateMaxPayloadSize(mtu protocol.ByteCount) protocol.ByteCount {
 //
 // A congestion.PathSender is installed on the connection's run loop, not
 // here: OnAttach is its first call and carries the connection's flight at that
-// moment. Any other controller is installed immediately.
+// moment. Any other controller is installed immediately, unless it replaces a
+// PathSender, which is also done on the run loop.
 func (c *Conn) SetCongestionControl(cc congestion.CongestionControl) {
-	if ps, ok := cc.(congestion.PathSender); ok {
-		c.pathSenderMx.Lock()
-		c.pendingPathSender = ps
+	c.pathSenderMx.Lock()
+	_, isPathSender := cc.(congestion.PathSender)
+	if isPathSender || c.hasPathSender.Load() || c.hasPendingInstall.Load() {
+		c.pendingController = cc
 		c.hasPendingInstall.Store(true)
 		c.pathSenderMx.Unlock()
 		c.scheduleSending()
 		return
 	}
-	c.pathSenderMx.Lock()
-	c.pendingPathSender = nil
-	c.hasPendingInstall.Store(false)
 	c.pathSenderMx.Unlock()
-	c.pathSenderReplaced.Store(true)
 	c.sentPacketHandler.SetCongestionControl(cc)
 }
 

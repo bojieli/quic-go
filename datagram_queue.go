@@ -29,6 +29,9 @@ type datagramQueue struct {
 	hasData func()
 	// discarded, if set, is told about frames the packer discards.
 	discarded func(*wire.DatagramFrame)
+	// drained is set once the queue was emptied at close. A tagged frame is
+	// refused after that, since nothing would report its outcome.
+	drained bool
 
 	logger utils.Logger
 }
@@ -48,6 +51,10 @@ func newDatagramQueue(hasData func(), logger utils.Logger) *datagramQueue {
 // Once that limit is reached, Add blocks until the queue size has reduced.
 func (h *datagramQueue) Add(f *wire.DatagramFrame) error {
 	h.sendMx.Lock()
+	if f.Tagged && h.drained {
+		h.sendMx.Unlock()
+		return h.closeErr
+	}
 
 	for {
 		if h.sendQueue.Len() < maxDatagramSendQueueLen {
@@ -98,6 +105,7 @@ func (h *datagramQueue) PopDiscarded() {
 // DiscardQueued removes every queued DATAGRAM frame and reports each one.
 func (h *datagramQueue) DiscardQueued(report func(*wire.DatagramFrame)) {
 	h.sendMx.Lock()
+	h.drained = true
 	var frames []*wire.DatagramFrame
 	for !h.sendQueue.Empty() {
 		frames = append(frames, h.sendQueue.PopFront())
