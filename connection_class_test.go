@@ -12,6 +12,7 @@ import (
 	mockackhandler "github.com/apernet/quic-go/internal/mocks/ackhandler"
 	"github.com/apernet/quic-go/internal/monotime"
 	"github.com/apernet/quic-go/internal/protocol"
+	"github.com/apernet/quic-go/internal/utils"
 	"github.com/apernet/quic-go/internal/wire"
 
 	"github.com/stretchr/testify/require"
@@ -228,16 +229,68 @@ func TestEmptyAdmittedBuildIsReportedToTheScheduler(t *testing.T) {
 	})
 }
 
-// An MTU probe goes only under a class permit that covers the largest probe.
+// An MTU probe goes only under a class permit that covers the probe that is
+// due.
 func TestMTUProbeNeedsAPermitThatCoversIt(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	sph := mockackhandler.NewMockSentPacketHandler(mockCtrl)
+	mtu := newMTUDiscoverer(utils.NewRTTStats(), 1200, protocol.MaxPacketBufferSize, nil)
+	probe := congestion.ByteCount(mtu.NextProbeSize())
 	for _, c := range []struct {
 		max  congestion.ByteCount
 		want bool
-	}{{128, false}, {1252, false}, {congestion.ByteCount(protocol.MaxPacketBufferSize), true}} {
-		conn := &Conn{classed: true, handshakeConfirmed: true, sentPacketHandler: permittingHandler{sph, congestion.Permit{OK: true, MaxBytes: c.max}}}
+	}{{128, false}, {probe - 1, false}, {probe, true}, {congestion.ByteCount(protocol.MaxPacketBufferSize), true}} {
+		conn := &Conn{classed: true, handshakeConfirmed: true, mtuDiscoverer: mtu, sentPacketHandler: permittingHandler{sph, congestion.Permit{OK: true, MaxBytes: c.max}}}
 		require.Equal(t, c.want, conn.permitCoversMTUProbe(), "MaxBytes %d", c.max)
 	}
 	require.True(t, (&Conn{}).permitCoversMTUProbe(), "without class scheduling probes are as before")
+}
+
+// exactGrantScheduler is a class scheduler that grants exactly the size it is
+// asked to admit.
+type exactGrantScheduler struct {
+	demandRecorder
+	asked []congestion.ByteCount
+}
+
+func (s *exactGrantScheduler) SchedulesClasses() bool { return true }
+func (s *exactGrantScheduler) Admit(_ monotime.Time, maxBytes congestion.ByteCount) congestion.Permit {
+	s.asked = append(s.asked, maxBytes)
+	return congestion.Permit{OK: true, Turn: congestion.ClassBulk, MaxBytes: maxBytes}
+}
+
+// A scheduler that grants exactly what it is asked still lets MTU discovery
+// send its first probe: while a probe is due, admission is asked for the
+// probe's size. The probe is not taken from the discoverer -- not in flight
+// -- by asking, and the request lasts one admission.
+func TestMTUProbeIsAdmittedAtItsOwnSize(t *testing.T) {
+	rtt := utils.NewRTTStats()
+	sph := ackhandler.NewSentPacketHandler(0, 1200, rtt, &utils.ConnectionStats{}, true, false, nil, protocol.PerspectiveClient, false, nil, utils.DefaultLogger)
+	now := monotime.Now()
+	sph.DropPackets(protocol.EncryptionInitial, now)
+	sph.DropPackets(protocol.EncryptionHandshake, now)
+	ps := &exactGrantScheduler{}
+	sph.InstallPathSender(ps, now, func() {})
+	mtu := newMTUDiscoverer(rtt, 1200, protocol.MaxPacketBufferSize, nil)
+	mtu.Start(now.Add(-time.Hour))
+	require.True(t, mtu.ShouldSendProbe(now))
+	probe := mtu.NextProbeSize()
+	require.Greater(t, probe, protocol.ByteCount(1200))
+	conn := &Conn{classed: true, handshakeConfirmed: true, mtuDiscoverer: mtu, sentPacketHandler: sph, pathSender: ps}
+
+	conn.requestMTUProbeAdmission(now)
+	require.Equal(t, ackhandler.SendAny, sph.SendMode(now))
+	require.Equal(t, []congestion.ByteCount{congestion.ByteCount(probe)}, ps.asked)
+	require.True(t, conn.permitCoversMTUProbe(), "the permit covers the probe")
+	require.True(t, mtu.ShouldSendProbe(now), "asking for admission does not put the probe in flight")
+
+	require.Equal(t, ackhandler.SendAny, sph.SendMode(now))
+	require.Equal(t, congestion.ByteCount(1200), ps.asked[1], "the request lasts one admission")
+	require.False(t, conn.permitCoversMTUProbe())
+
+	// No probe due: ordinary admissions.
+	_, _ = mtu.GetPing(now)
+	conn.requestMTUProbeAdmission(now)
+	require.Equal(t, ackhandler.SendAny, sph.SendMode(now))
+	require.Equal(t, congestion.ByteCount(1200), ps.asked[2])
 }

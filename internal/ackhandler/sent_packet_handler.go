@@ -124,6 +124,10 @@ type sentPacketHandler struct {
 	classBuiltPending bool
 	// ackLenPending is the size of the next packet's ACK frame.
 	ackLenPending protocol.ByteCount
+	// admitSizePending is the size the next SendMode asks a PathSender to
+	// admit, when the packet may be larger than maxDatagramSize (an MTU
+	// probe). Zero means maxDatagramSize.
+	admitSizePending protocol.ByteCount
 	// discardRefs is scratch space for OnDiscarded.
 	discardRefs []congestionExt.PacketRef
 	// lateAcks holds the ack-eliciting application packets declared lost,
@@ -612,9 +616,7 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		}
 		if (p.EncryptionLevel == protocol.Encryption1RTT || p.EncryptionLevel == protocol.Encryption0RTT) &&
 			!p.isPathProbePacket && p.IsAckEliciting() {
-			h.progress.Epoch++
-			h.progress.Last = rcvTime
-			h.progress.PTOExpiries = 0
+			h.progress.EndEpisode(rcvTime)
 		}
 		h.removeFromBytesInFlight(p.packet)
 		if !p.isPathProbePacket {
@@ -755,9 +757,7 @@ func (h *sentPacketHandler) creditLateAcks(ack *wire.AckFrame, rcvTime monotime.
 			continue
 		}
 		for _, rec := range h.lateAcks[lo:hi] {
-			h.progress.Epoch++
-			h.progress.Last = rcvTime
-			h.progress.PTOExpiries = 0
+			h.progress.EndEpisode(rcvTime)
 			if rec.counted {
 				// A spurious loss: the transport takes back what it counted.
 				h.connStats.PacketsLost.Add(^uint64(0))
@@ -1300,6 +1300,9 @@ func (h *sentPacketHandler) PopPacketNumber(encLevel protocol.EncryptionLevel) p
 
 func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
 	cc, ps := h.getControllers()
+	// A request to admit a larger packet applies to this call only.
+	admitSize := max(h.maxDatagramSize, h.admitSizePending)
+	h.admitSizePending = 0
 	if ps != nil {
 		// A permit covers only the build that follows the Admit that issued it.
 		h.permit = congestionExt.Permit{}
@@ -1330,7 +1333,7 @@ func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
 		return h.ptoMode
 	}
 	if ps != nil {
-		return h.pathSenderSendMode(ps, now, numTrackedPackets)
+		return h.pathSenderSendMode(ps, now, numTrackedPackets, admitSize)
 	}
 	// Only send ACKs if we're congestion limited.
 	if !cc.CanSend(h.bytesInFlight) {
@@ -1355,8 +1358,8 @@ func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
 // HasPacingBudget. A window refusal (no RetryAt) maps to SendAck, a pacing or
 // precedence refusal to SendPacingLimited, in the same order as for any other
 // controller.
-func (h *sentPacketHandler) pathSenderSendMode(ps congestionExt.PathSender, now monotime.Time, numTrackedPackets int) SendMode {
-	h.permit = ps.Admit(now, congestionExt.ByteCount(h.maxDatagramSize))
+func (h *sentPacketHandler) pathSenderSendMode(ps congestionExt.PathSender, now monotime.Time, numTrackedPackets int, size protocol.ByteCount) SendMode {
+	h.permit = ps.Admit(now, congestionExt.ByteCount(size))
 	if h.classed && h.permit.OK && h.permit.MaxBytes < congestionExt.MinClassedPermit {
 		// Too small to build a packet in: a window refusal, so the exempt
 		// obligations, due ACKs among them, still go.
@@ -1666,6 +1669,11 @@ func (h *sentPacketHandler) ExpectClassBuilt() { h.classBuiltPending = true }
 // ExpectGrantedPacket says the next packet was built under a verification
 // grant.
 func (h *sentPacketHandler) ExpectGrantedPacket(id uint64) { h.grantPending = id }
+
+// RequestAdmission asks the next SendMode, and only that one, to have a
+// PathSender admit a packet of n bytes rather than of the maximum datagram
+// size: an MTU probe, which is larger. A smaller n changes nothing.
+func (h *sentPacketHandler) RequestAdmission(n protocol.ByteCount) { h.admitSizePending = n }
 
 // ExpectAckLength says how long the next packet's ACK frame is.
 func (h *sentPacketHandler) ExpectAckLength(n protocol.ByteCount) { h.ackLenPending = n }

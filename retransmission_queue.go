@@ -75,36 +75,66 @@ func (q *retransmissionQueue) HasData(encLevel protocol.EncryptionLevel) bool {
 	return false
 }
 
-// GetFittingFrame is GetFrame for a class budget on 1-RTT: a frame that does
-// not fit stays queued, in order, and a smaller one behind it is taken.
-func (q *retransmissionQueue) GetFittingFrame(maxLen protocol.ByteCount, v protocol.Version) wire.Frame {
-	if maxLen <= 0 {
-		return nil
-	}
+// AppendFittingFrames is GetFrame for a class budget on 1-RTT: it appends
+// the queued frames that fit maxLen, in order, and returns how many bytes
+// they take. A frame that does not fit stays queued, in order, and smaller
+// ones behind it are taken. The queue is compacted once per call, so a pass
+// behind an oversized frame costs one walk of the queue, not one copy of its
+// tail per frame taken.
+func (q *retransmissionQueue) AppendFittingFrames(frames []ackhandler.Frame, maxLen protocol.ByteCount, v protocol.Version) ([]ackhandler.Frame, protocol.ByteCount) {
 	r := &q.appData
-	if len(r.crypto) > 0 {
+	handler := q.AckHandler(protocol.Encryption1RTT)
+	var used protocol.ByteCount
+	for len(r.crypto) > 0 && used < maxLen {
 		f := r.crypto[0]
-		newFrame, needsSplit := f.MaybeSplitOffFrame(maxLen, v)
+		newFrame, needsSplit := f.MaybeSplitOffFrame(maxLen-used, v)
 		if newFrame == nil && !needsSplit {
 			r.crypto = r.crypto[1:]
-			return f
+			frames = append(frames, ackhandler.Frame{Frame: f, Handler: handler})
+			used += f.Length(v)
+			continue
 		}
-		if newFrame != nil {
-			return newFrame
+		if newFrame == nil {
+			break
 		}
+		frames = append(frames, ackhandler.Frame{Frame: newFrame, Handler: handler})
+		used += newFrame.Length(v)
 	}
+	// taken is how many frames from the front were taken before the first
+	// one kept; kept is where the next kept frame goes once one was, which
+	// compacts the queue in place, in order.
+	taken, kept := 0, -1
 	for i, f := range r.other {
-		if f.Length(v) <= maxLen {
-			if i == 0 {
-				// The common case, in constant time, as GetFrame.
-				r.other = r.other[1:]
-			} else {
-				r.other = append(r.other[:i], r.other[i+1:]...)
+		if used >= maxLen {
+			if kept >= 0 {
+				kept += copy(r.other[kept:], r.other[i:])
 			}
-			return f
+			break
 		}
+		if l := f.Length(v); l <= maxLen-used {
+			frames = append(frames, ackhandler.Frame{Frame: f, Handler: handler})
+			used += l
+			if kept < 0 {
+				taken++
+			}
+			continue
+		}
+		if kept < 0 {
+			// Every frame before this one was taken.
+			kept = 0
+		}
+		r.other[kept] = f
+		kept++
 	}
-	return nil
+	switch {
+	case kept >= 0:
+		clear(r.other[kept:])
+		r.other = r.other[:kept]
+	default:
+		// Only a prefix was taken: drop it in constant time, as GetFrame.
+		r.other = r.other[taken:]
+	}
+	return frames, used
 }
 
 func (q *retransmissionQueue) GetFrame(encLevel protocol.EncryptionLevel, maxLen protocol.ByteCount, v protocol.Version) wire.Frame {

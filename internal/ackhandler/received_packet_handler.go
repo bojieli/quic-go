@@ -15,6 +15,9 @@ type ReceivedPacketHandler struct {
 	appDataPackets   appDataReceivedPacketTracker
 
 	lowest1RTTPacket protocol.PacketNumber
+
+	// peekAck is scratch space for AckFrameLength.
+	peekAck wire.AckFrame
 }
 
 func NewReceivedPacketHandler(logger utils.Logger) *ReceivedPacketHandler {
@@ -85,6 +88,19 @@ func (h *ReceivedPacketHandler) HasAckDue(now monotime.Time) bool {
 		return true
 	}
 	return !t.ackAlarm.IsZero() && !t.ackAlarm.After(now)
+}
+
+// AckFrameLength is the length of the application-data ACK frame that
+// GetAckFrame(protocol.Encryption1RTT, now, false) would return, or zero when
+// it would return none. It consumes nothing.
+func (h *ReceivedPacketHandler) AckFrameLength(now monotime.Time, v protocol.Version) protocol.ByteCount {
+	t := &h.appDataPackets
+	if !t.hasNewAck {
+		return 0
+	}
+	t.fillAckFrame(&h.peekAck)
+	h.peekAck.DelayTime = max(0, now.Sub(t.largestObservedRcvdTime))
+	return h.peekAck.Length(v)
 }
 
 func (h *ReceivedPacketHandler) GetAlarmTimeout() monotime.Time {

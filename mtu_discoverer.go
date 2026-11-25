@@ -17,6 +17,9 @@ type mtuDiscoverer interface {
 	ShouldSendProbe(now monotime.Time) bool
 	CurrentSize() protocol.ByteCount
 	GetPing(now monotime.Time) (ping ackhandler.Frame, datagramSize protocol.ByteCount)
+	// NextProbeSize is the datagram size of the probe GetPing would return
+	// now. It changes nothing: the probe is not in flight until GetPing.
+	NextProbeSize() protocol.ByteCount
 	Reset(now monotime.Time, start, max protocol.ByteCount)
 }
 
@@ -161,13 +164,15 @@ func (f *mtuFinder) ShouldSendProbe(now monotime.Time) bool {
 	return !now.Before(f.lastProbeTime.Add(mtuProbeDelay * f.rttStats.SmoothedRTT()))
 }
 
-func (f *mtuFinder) GetPing(now monotime.Time) (ackhandler.Frame, protocol.ByteCount) {
-	var size protocol.ByteCount
+func (f *mtuFinder) NextProbeSize() protocol.ByteCount {
 	if f.lastProbeWasLost {
-		size = (f.min + f.lost[0]) / 2
-	} else {
-		size = (f.min + f.max()) / 2
+		return (f.min + f.lost[0]) / 2
 	}
+	return (f.min + f.max()) / 2
+}
+
+func (f *mtuFinder) GetPing(now monotime.Time) (ackhandler.Frame, protocol.ByteCount) {
+	size := f.NextProbeSize()
 	f.lastProbeTime = now
 	f.inFlight = size
 	return ackhandler.Frame{

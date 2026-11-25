@@ -696,3 +696,131 @@ func TestClassedBuilderTakesNoEarlyAckForADatagramThatCannotFit(t *testing.T) {
 	require.Equal(t, []bool{true}, acks.onlyIfQueued)
 	require.NotNil(t, h.dq.Peek())
 }
+
+// bigFrameStream hands out one STREAM frame that leaves leave bytes of the
+// budget it is offered.
+type bigFrameStream struct {
+	fakeClassedStream
+	leave protocol.ByteCount
+}
+
+func (s *bigFrameStream) popClassedStreamFrame(maxBytes protocol.ByteCount, want congestion.SendClass, v protocol.Version) (ackhandler.StreamFrame, *wire.StreamDataBlockedFrame, bool, congestion.SendClass, congestion.SendClass) {
+	f := &wire.StreamFrame{StreamID: s.id, DataLenPresent: true}
+	f.Data = make([]byte, maxBytes-s.leave-f.Length(v)-2)
+	return ackhandler.StreamFrame{Frame: f}, nil, false, s.class, s.class
+}
+
+// The scan bound for a small budget also applies once the budget becomes
+// small during the scan: after one stream's frame leaves a few bytes, the
+// rest are offered to a few streams, not to the whole ring.
+func TestClassedFramerBoundsTheScanOnceTheBudgetShrinks(t *testing.T) {
+	h := newBuilderHarness(true)
+	big := &bigFrameStream{fakeClassedStream: fakeClassedStream{id: 4, class: congestion.ClassBulk}, leave: 20}
+	h.framer.AddActiveStream(big.id, big)
+	var pops int
+	for i := range 100 {
+		s := &countingClassedStream{fakeClassedStream: fakeClassedStream{id: protocol.StreamID(4 * (i + 2)), class: congestion.ClassBulk}, pops: &pops}
+		h.framer.AddActiveStream(s.id, s)
+	}
+	h.framer.SetBoundSmallScans(false) // the packet is empty when the pass starts
+	_, sfs, n := h.framer.AppendClass(nil, nil, congestion.ClassBulk, 1200, false, monotime.Now(), protocol.Version1)
+	require.Len(t, sfs, 1)
+	require.Less(t, 1200-n, smallClassBudget, "setup: the first frame leaves a small budget")
+	require.LessOrEqual(t, pops, smallBudgetTries)
+}
+
+// sizedFrame is a control frame of a set length that counts how often its
+// length is asked, which is how often a builder looks at it.
+type sizedFrame struct {
+	id      int
+	size    protocol.ByteCount
+	lengths *int
+}
+
+func (f *sizedFrame) Append(b []byte, _ protocol.Version) ([]byte, error) {
+	return append(b, make([]byte, f.size)...), nil
+}
+
+func (f *sizedFrame) Length(protocol.Version) protocol.ByteCount {
+	*f.lengths++
+	return f.size
+}
+
+// Control retransmissions queued behind frames too large for the permit are
+// taken in one walk of the queue per packet, not one walk (and one copy of
+// the tail) per frame taken, and the queue keeps its order.
+func TestClassedControlRetransmissionsDrainInOnePass(t *testing.T) {
+	h := newBuilderHarness(true)
+	var lengths int
+	const oversized, small = 200, 1000
+	for i := range oversized + small {
+		size := protocol.ByteCount(10)
+		if i < oversized {
+			size = 2000
+		}
+		h.packer.retransmissionQueue.addAppData(&sizedFrame{id: i, size: size, lengths: &lengths})
+	}
+	var got []int
+	for pass := 1; len(got) < small; pass++ {
+		lengths = 0
+		queued := len(h.packer.retransmissionQueue.appData.other)
+		pl := h.packer.composeClassedPacket(testPayload, testPayload, congestion.Permit{OK: true, Turn: congestion.ClassControl, MaxBytes: 1252}, true, monotime.Now(), protocol.Version1)
+		require.NotEmpty(t, pl.frames)
+		require.LessOrEqual(t, lengths, queued, "pass %d looked at frames more than once", pass)
+		for _, f := range pl.frames {
+			got = append(got, f.Frame.(*sizedFrame).id)
+		}
+	}
+	for i, id := range got {
+		require.Equal(t, oversized+i, id, "the small frames are taken in order")
+	}
+	rest := h.packer.retransmissionQueue.appData.other
+	require.Len(t, rest, oversized)
+	for i, f := range rest {
+		require.Equal(t, i, f.(*sizedFrame).id, "the oversized frames stay queued in order")
+	}
+}
+
+// An ACK that is not yet due is taken early for a datagram only when the
+// datagram fits the packet's payload beside it. MaxBytes counts the header
+// and the AEAD tag; a datagram that fits MaxBytes but not the payload left
+// after the ACK is no reason to spend the ACK on an ACK-only packet.
+func TestClassedBuilderTakesAnEarlyAckOnlyForADatagramThatFitsBesideIt(t *testing.T) {
+	for _, fits := range []bool{false, true} {
+		h := newBuilderHarness(true)
+		rph := ackhandler.NewReceivedPacketHandler(utils.DefaultLogger)
+		now := monotime.Now()
+		require.NoError(t, rph.ReceivedPacket(1, protocol.ECNNon, protocol.Encryption1RTT, now, true))
+		require.NoError(t, rph.ReceivedPacket(4, protocol.ECNNon, protocol.Encryption1RTT, now, false))
+		require.False(t, rph.HasAckDue(now), "setup: the ACK is not due yet")
+		h.packer.acks = rph
+		ackLen := rph.AckFrameLength(now, protocol.Version1)
+		require.NotZero(t, ackLen)
+
+		// A datagram that fits the payload alone but not beside the ACK, or
+		// one that fits beside it.
+		dg := &wire.DatagramFrame{DataLenPresent: true}
+		size := testPayload - ackLen + 1
+		if fits {
+			size = testPayload - ackLen
+		}
+		dg.Data = make([]byte, size-dg.Length(protocol.Version1)-2)
+		for dg.Length(protocol.Version1) < size {
+			dg.Data = append(dg.Data, 0)
+		}
+		require.Equal(t, size, dg.Length(protocol.Version1))
+		require.NoError(t, h.dq.Add(dg))
+
+		permit := congestion.Permit{OK: true, Turn: congestion.ClassInteractive, MaxBytes: 1252}
+		pl := h.packer.composeClassedPacket(testPayload, testPayload, permit, true, now, protocol.Version1)
+		require.Len(t, pl.frames, 1, "fits beside the ACK: %v", fits)
+		require.Equal(t, dg, pl.frames[0].Frame, "the datagram is sent")
+		if fits {
+			require.NotNil(t, pl.ack, "an ACK is taken early when it rides with the datagram")
+			require.LessOrEqual(t, pl.length, testPayload)
+		} else {
+			require.Nil(t, pl.ack, "the ACK was taken for a datagram that cannot ride with it")
+			require.Equal(t, ackLen, rph.AckFrameLength(now, protocol.Version1), "the ACK stays for a later packet")
+		}
+	}
+}

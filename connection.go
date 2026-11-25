@@ -928,7 +928,25 @@ type ConnectionStats struct {
 	// ElicitingOutstanding says an ack-eliciting application-data packet is
 	// outstanding.
 	ElicitingOutstanding bool
+	// A probe-timeout episode is a run of one or more probe timeouts that
+	// ends when ProgressEpoch next moves; its peak is
+	// PTOExpiriesSinceProgress just before that. The episode fields are kept
+	// as each episode ends, so a reader that polls the snapshot still counts
+	// an episode that opened and closed between two reads.
+	//
+	// PTOEpisodes counts completed episodes. It only grows.
+	PTOEpisodes uint64
+	// LastPTOEpisodePeak is the peak of the last completed episode.
+	LastPTOEpisodePeak uint32
+	// PTOEpisodesReaching[n-1] counts completed episodes whose peak reached
+	// n probe timeouts; the last bucket counts every episode that reached
+	// PTOEpisodeBuckets or more. Every bucket only grows.
+	PTOEpisodesReaching [PTOEpisodeBuckets]uint64
 }
+
+// PTOEpisodeBuckets is the number of buckets of
+// ConnectionStats.PTOEpisodesReaching.
+const PTOEpisodeBuckets = utils.PTOEpisodeBuckets
 
 func (c *Conn) ConnectionStats() ConnectionStats {
 	stats := ConnectionStats{
@@ -951,6 +969,9 @@ func (c *Conn) ConnectionStats() ConnectionStats {
 	}
 	stats.PTOExpiriesSinceProgress = progress.PTOExpiries
 	stats.ElicitingOutstanding = progress.ElicitingOutstanding
+	stats.PTOEpisodes = progress.PTOEpisodes
+	stats.LastPTOEpisodePeak = progress.LastEpisodePeak
+	stats.PTOEpisodesReaching = progress.EpisodesReaching
 	return stats
 }
 
@@ -2673,6 +2694,7 @@ func (c *Conn) triggerSending(now monotime.Time) error {
 	c.pacingDeadline = 0
 	if c.pathSender != nil {
 		c.updateDemand()
+		c.requestMTUProbeAdmission(now)
 	}
 
 	sendMode := c.sentPacketHandler.SendMode(now)
@@ -3029,13 +3051,27 @@ func (c *Conn) setClassed(on bool) {
 	c.demand = congestion.Demand{}
 }
 
-// permitCoversMTUProbe says whether the packet about to be built may be an
-// MTU probe. Under a class-scheduled permit a probe, larger than an ordinary
-// packet, goes only when the permit's MaxBytes covers the largest probe;
+// requestMTUProbeAdmission asks the next admission of a class-scheduled
+// connection to cover the MTU probe that is due, which is larger than an
+// ordinary packet. A scheduler that grants what it is asked would otherwise
+// never issue a permit the probe fits. The probe is not taken from the
+// discoverer, so not in flight, until a permit covers it.
+func (c *Conn) requestMTUProbeAdmission(now monotime.Time) {
+	if !c.classed || !c.handshakeConfirmed || c.mtuDiscoverer == nil || !c.mtuDiscoverer.ShouldSendProbe(now) {
+		return
+	}
+	if r, ok := c.sentPacketHandler.(interface{ RequestAdmission(protocol.ByteCount) }); ok {
+		r.RequestAdmission(c.mtuDiscoverer.NextProbeSize())
+	}
+}
+
+// permitCoversMTUProbe says whether the packet about to be built may be the
+// MTU probe that is due. Under a class-scheduled permit a probe, larger than
+// an ordinary packet, goes only when the permit's MaxBytes covers it;
 // otherwise the permit builds ordinary work and the probe waits.
 func (c *Conn) permitCoversMTUProbe() bool {
 	permit, ok := c.currentClassPermit()
-	return !ok || permit.MaxBytes >= congestion.ByteCount(protocol.MaxPacketBufferSize)
+	return !ok || permit.MaxBytes >= congestion.ByteCount(c.mtuDiscoverer.NextProbeSize())
 }
 
 // currentClassPermit is the packer's view of the permit the next packet is
@@ -3070,7 +3106,7 @@ func (c *Conn) sendPackets(now monotime.Time) error {
 	// Can't use GSO, since we need to send a single packet that's larger than our current maximum size.
 	// Performance-wise, this doesn't matter, since we only send a very small (<10) number of
 	// MTU probe packets per connection.
-	if c.handshakeConfirmed && c.mtuDiscoverer != nil && c.permitCoversMTUProbe() && c.mtuDiscoverer.ShouldSendProbe(now) {
+	if c.handshakeConfirmed && c.mtuDiscoverer != nil && c.mtuDiscoverer.ShouldSendProbe(now) && c.permitCoversMTUProbe() {
 		ping, size := c.mtuDiscoverer.GetPing(now)
 		p, buf, err := c.packer.PackMTUProbePacket(ping, size, c.version)
 		if err != nil {

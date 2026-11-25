@@ -3,6 +3,7 @@ package quic
 import (
 	"testing"
 
+	"github.com/apernet/quic-go/internal/ackhandler"
 	"github.com/apernet/quic-go/internal/protocol"
 	"github.com/apernet/quic-go/internal/wire"
 
@@ -128,4 +129,38 @@ func testRetransmissionQueueDropEncLevel(t *testing.T, encLevel protocol.Encrypt
 	ah.OnLost(&wire.CryptoFrame{Data: []byte("foobar")})
 	ah.OnLost(&wire.PingFrame{})
 	require.False(t, q.HasData(encLevel))
+}
+
+func TestRetransmissionQueueAppendFittingFrames(t *testing.T) {
+	q := newRetransmissionQueue()
+	big := &wire.NewConnectionIDFrame{SequenceNumber: 1, ConnectionID: protocol.ParseConnectionID(make([]byte, 20))}
+	q.addAppData(&wire.MaxDataFrame{MaximumData: 1})
+	q.addAppData(big)
+	q.addAppData(&wire.MaxDataFrame{MaximumData: 2})
+	q.addAppData(big)
+	q.addAppData(&wire.MaxDataFrame{MaximumData: 3})
+	q.addAppData(&wire.MaxDataFrame{MaximumData: 4})
+	small := (&wire.MaxDataFrame{MaximumData: 1}).Length(protocol.Version1)
+
+	// Room for three small frames: the first three, skipping what does not fit.
+	frames, n := q.AppendFittingFrames(nil, 3*small, protocol.Version1)
+	require.Equal(t, 3*small, n)
+	require.Len(t, frames, 3)
+	for i, f := range frames {
+		require.Equal(t, &wire.MaxDataFrame{MaximumData: protocol.ByteCount(i + 1)}, f.Frame)
+		require.NotNil(t, f.Handler)
+	}
+	require.Equal(t, []wire.Frame{big, big, &wire.MaxDataFrame{MaximumData: 4}}, q.appData.other)
+
+	// A prefix that fits is taken without disturbing the rest.
+	frames, _ = q.AppendFittingFrames(nil, big.Length(protocol.Version1), protocol.Version1)
+	require.Equal(t, []ackhandler.Frame{{Frame: big, Handler: q.AckHandler(protocol.Encryption1RTT)}}, frames)
+	require.Equal(t, []wire.Frame{big, &wire.MaxDataFrame{MaximumData: 4}}, q.appData.other)
+
+	frames, n = q.AppendFittingFrames(nil, 0, protocol.Version1)
+	require.Empty(t, frames)
+	require.Zero(t, n)
+	frames, _ = q.AppendFittingFrames(nil, 1000, protocol.Version1)
+	require.Len(t, frames, 2)
+	require.False(t, q.HasData(protocol.Encryption1RTT))
 }

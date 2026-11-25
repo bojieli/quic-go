@@ -157,9 +157,10 @@ type Permit struct {
 // class, and SentPacket.ClassBytes reports the bytes actually built by class,
 // with the packet overhead charged to the turn. A datagram that does not fit
 // a class's allowance stays queued. PTO probes and MTU probes are built
-// without regard to the turn; an MTU probe's bytes are INTERACTIVE, and a
-// probe goes only under a permit whose MaxBytes covers the largest probe
-// (protocol.MaxPacketBufferSize), so a smaller permit is never exceeded.
+// without regard to the turn; an MTU probe's bytes are INTERACTIVE. While an
+// MTU probe is due, Admit is asked for the probe's size rather than the
+// connection's packet size, and the probe goes only under a permit whose
+// MaxBytes covers it, so a smaller permit is never exceeded.
 //
 // Permits are executed from handshake confirmation on. Before it, packets
 // are coalesced with Initial and Handshake packets whose CRYPTO data and
