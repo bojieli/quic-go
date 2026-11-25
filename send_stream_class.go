@@ -70,6 +70,7 @@ func (s *SendStream) SetBoost(on bool) {
 		for _, f := range s.retransmissionQueue {
 			f.Class = uint8(congestion.ClassControl)
 		}
+		s.controlRetx = len(s.retransmissionQueue)
 		if s.heldEnd() > s.writeOffset {
 			s.recordClass(s.writeOffset, congestion.ClassControl)
 		}
@@ -172,6 +173,24 @@ func (s *SendStream) unsentControlEnd() protocol.ByteCount {
 	return end
 }
 
+// countRetx adjusts the count of queued CONTROL retransmissions as f joins
+// (delta 1) or leaves (delta -1) the queue. It must be called with the mutex
+// held.
+func (s *SendStream) countRetx(f *wire.StreamFrame, delta int) {
+	if f.Class == uint8(congestion.ClassControl) {
+		s.controlRetx += delta
+	}
+}
+
+// recountRetx recounts the queued CONTROL retransmissions after the queue
+// was rebuilt. It must be called with the mutex held.
+func (s *SendStream) recountRetx() {
+	s.controlRetx = 0
+	for _, f := range s.retransmissionQueue {
+		s.countRetx(f, 1)
+	}
+}
+
 // frameClass is the class a queued retransmission was charged to.
 func frameClass(f *wire.StreamFrame) congestion.SendClass {
 	if f.Class == 0 {
@@ -191,10 +210,8 @@ func (s *SendStream) effectiveClass() congestion.SendClass {
 	if s.boost {
 		return congestion.ClassControl
 	}
-	for _, f := range s.retransmissionQueue {
-		if frameClass(f) == congestion.ClassControl {
-			return congestion.ClassControl
-		}
+	if s.controlRetx > 0 {
+		return congestion.ClassControl
 	}
 	if s.unsentControlEnd() > s.writeOffset {
 		return congestion.ClassControl
@@ -246,6 +263,15 @@ func (s *SendStream) popClassedStreamFrame(maxBytes protocol.ByteCount, want con
 	if served != want {
 		s.mutex.Unlock()
 		return ackhandler.StreamFrame{}, nil, true, served, served
+	}
+	if len(s.retransmissionQueue) == 0 && len(s.dataForWriting) == 0 && s.nextFrame == nil && s.finishedWriting && !s.finSent && s.shutdownErr == nil && s.resetErr == nil {
+		// Only a FIN is left. The ordinary pop does not size it, since the
+		// ordinary builder always has room; a class budget may not.
+		fin := wire.StreamFrame{StreamID: s.streamID, Offset: s.writeOffset, DataLenPresent: true, Fin: true}
+		if fin.Length(v) > maxBytes {
+			s.mutex.Unlock()
+			return ackhandler.StreamFrame{}, nil, true, served, served
+		}
 	}
 	if s.classTagged && len(s.retransmissionQueue) == 0 {
 		if _, end := s.newDataClass(); end != noClassLimit && end > s.writeOffset {

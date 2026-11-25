@@ -9,12 +9,6 @@ import (
 	"github.com/apernet/quic-go/quicvarint"
 )
 
-// minClassedStreamFrame is the least space worth offering a stream when a
-// class is served: a STREAM frame's header and one byte. Unlike the ordinary
-// builder's 128-byte threshold for leftover space, a class budget may be all
-// a stream gets, so a small one must still make progress.
-const minClassedStreamFrame protocol.ByteCount = 16
-
 // ringEntry is a stream filed in a class ring. Only the entry whose
 // generation is the stream's current one is live; re-filing a stream makes a
 // new entry and leaves the old one to be skipped, so a stream that moves away
@@ -217,7 +211,7 @@ func (f *framer) AppendClass(
 				frames = append(frames, ackhandler.Frame{Frame: blocked})
 				length += l
 			} else {
-				f.controlFrames = append(f.controlFrames, blocked)
+				f.queueNotificationLocked(blocked)
 			}
 		}
 	}
@@ -231,8 +225,7 @@ func (f *framer) AppendClass(
 // CRYPTO frame is split to the space left. It must be called with
 // controlFrameMutex held.
 func (f *framer) appendClassedControlFrames(frames []ackhandler.Frame, maxLen protocol.ByteCount, now monotime.Time, v protocol.Version) ([]ackhandler.Frame, protocol.ByteCount) {
-	// RESET_STREAM_AT, the largest stream control frame, is 33 bytes.
-	frames, length := f.appendStreamControlFramesBelow(frames, 0, maxLen, maxStreamControlFrameSizeAt, now, v)
+	frames, length := f.appendClassedStreamControlFrames(frames, maxLen, now, v)
 	// The queue is popped from its end. Frames are taken from the end down
 	// to the first index examined; those kept are compacted in place over
 	// the examined range, in their order, and the unexamined front stays
@@ -267,9 +260,75 @@ func (f *framer) appendClassedControlFrames(frames []ackhandler.Frame, maxLen pr
 	return frames, length
 }
 
-// maxStreamControlFrameSizeAt is the largest stream control frame,
-// RESET_STREAM_AT with four eight-byte varints.
-const maxStreamControlFrameSizeAt = 33
+// appendClassedStreamControlFrames is the CONTROL pass's share of the
+// streams' control frames, sized against each frame's actual length: a
+// frame that does not fit the allowance is held, in order, and goes first in
+// a later pass, so a small allowance still carries a small MAX_STREAM_DATA.
+// It must be called with controlFrameMutex held.
+func (f *framer) appendClassedStreamControlFrames(frames []ackhandler.Frame, maxLen protocol.ByteCount, now monotime.Time, v protocol.Version) ([]ackhandler.Frame, protocol.ByteCount) {
+	var length protocol.ByteCount
+	held := f.heldStreamControl[:0]
+	for _, fr := range f.heldStreamControl {
+		if l := fr.Frame.Length(v); l <= maxLen-length {
+			frames = append(frames, fr)
+			length += l
+		} else {
+			held = append(held, fr)
+		}
+	}
+	clear(f.heldStreamControl[len(held):])
+	f.heldStreamControl = held
+	for id, str := range f.streamsWithControlFrames {
+		for maxLen-length > 0 {
+			fr, ok, hasMore := str.getControlFrame(now)
+			if !hasMore {
+				delete(f.streamsWithControlFrames, id)
+			}
+			if ok {
+				if l := fr.Frame.Length(v); l <= maxLen-length {
+					frames = append(frames, fr)
+					length += l
+				} else {
+					f.heldStreamControl = append(f.heldStreamControl, fr)
+				}
+			}
+			if !hasMore {
+				break
+			}
+		}
+		if maxLen-length <= 0 {
+			break
+		}
+	}
+	return frames, length
+}
+
+// queueNotificationLocked queues a STREAM_DATA_BLOCKED or DATA_BLOCKED for a
+// later CONTROL pass. A newer notification replaces a queued one for the
+// same stream (or for the connection), so a class that gets no CONTROL turn
+// cannot grow the queue past one notification per stream. It must be called
+// with controlFrameMutex held.
+func (f *framer) queueNotificationLocked(frame wire.Frame) {
+	for i, q := range f.controlFrames {
+		switch n := frame.(type) {
+		case *wire.StreamDataBlockedFrame:
+			if old, ok := q.(*wire.StreamDataBlockedFrame); ok && old.StreamID == n.StreamID {
+				f.controlFrames[i] = frame
+				return
+			}
+		case *wire.DataBlockedFrame:
+			if _, ok := q.(*wire.DataBlockedFrame); ok {
+				f.controlFrames[i] = frame
+				return
+			}
+		}
+	}
+	if len(f.controlFrames) >= maxControlFrames {
+		// Advisory: a peer learns of the block again on the next one.
+		return
+	}
+	f.controlFrames = append(f.controlFrames, frame)
+}
 
 // RefileStream re-files an active stream whose effective class may have
 // changed outside the framer's own pops (a verification grant's build path).
@@ -301,7 +360,9 @@ func (f *framer) appendClassStreams(
 	defer func() { f.serving = false }()
 	for range ring.Len() {
 		remaining := maxLen - length
-		if remaining < minClassedStreamFrame {
+		if remaining <= 0 {
+			// The stream's own frame sizing decides what fits a small
+			// budget; nothing fits none.
 			break
 		}
 		e := ring.PopFront()
@@ -352,7 +413,7 @@ func (f *framer) appendClassStreams(
 				frames = append(frames, ackhandler.Frame{Frame: blocked})
 				length += l
 			} else {
-				f.controlFrames = append(f.controlFrames, blocked)
+				f.queueNotificationLocked(blocked)
 			}
 		}
 	}
@@ -386,7 +447,7 @@ func (f *framer) appendAllClasses(
 				frames = append(frames, ackhandler.Frame{Frame: blocked})
 				length += l
 			} else {
-				f.controlFrames = append(f.controlFrames, blocked)
+				f.queueNotificationLocked(blocked)
 			}
 		}
 	}

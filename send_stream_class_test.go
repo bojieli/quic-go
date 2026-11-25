@@ -21,6 +21,7 @@ func newClassTestStream(t *testing.T, id protocol.StreamID) *SendStream {
 	str := newSendStream(context.Background(), id, sender, fc, false)
 	sender.EXPECT().onHasStreamData(id, str).AnyTimes()
 	sender.EXPECT().onStreamCompleted(gomock.Any()).AnyTimes()
+	sender.EXPECT().onHasStreamControlFrame(id, gomock.Any()).AnyTimes()
 	return str
 }
 
@@ -168,4 +169,66 @@ func TestGrantedRetransmissionIsChargedAtTheBoostedClass(t *testing.T) {
 	r, _ := str.popGrantedStreamFrame(1200, 0, 1000, true, protocol.Version1)
 	require.NotNil(t, r.Frame)
 	require.Equal(t, uint8(congestion.ClassControl), r.Frame.Class)
+}
+
+// Item 4: granted new data is charged to the stream's effective class -- here
+// CONTROL, because a CONTROL retransmission outside the grant is queued.
+func TestGrantedNewDataIsChargedAtTheEffectiveClass(t *testing.T) {
+	str := newClassTestStream(t, 28)
+	writeClassBuffered(t, str, 50, congestion.ClassControl)
+	f, served, _ := popClassed(t, str, 1200)
+	require.Equal(t, congestion.ClassControl, served)
+	f.Handler.OnLost(f.Frame) // a CONTROL retransmission of [0, 50)
+	writeClassBuffered(t, str, 100, congestion.ClassBulk)
+	g, _ := str.popGrantedStreamFrame(1200, 50, 150, true, protocol.Version1)
+	require.NotNil(t, g.Frame)
+	require.Equal(t, protocol.ByteCount(50), g.Frame.Offset)
+	require.Equal(t, uint8(congestion.ClassControl), g.Frame.Class, "charged to the class the stream is served at")
+}
+
+// Item 5: the count of queued CONTROL retransmissions matches the queue
+// through every way the queue changes, so the effective class needs no scan.
+func TestControlRetransmissionCountTracksTheQueue(t *testing.T) {
+	str := newClassTestStream(t, 32)
+	check := func() {
+		t.Helper()
+		str.mutex.Lock()
+		defer str.mutex.Unlock()
+		n := 0
+		for _, f := range str.retransmissionQueue {
+			if f.Class == uint8(congestion.ClassControl) {
+				n++
+			}
+		}
+		require.Equal(t, n, str.controlRetx)
+	}
+	var sent []ackhandler.StreamFrame
+	for i := range 6 {
+		class := congestion.ClassBulk
+		if i%2 == 0 {
+			class = congestion.ClassControl
+		}
+		writeClassBuffered(t, str, 100, class)
+		f, _, _ := popClassed(t, str, 1200)
+		sent = append(sent, f)
+	}
+	for _, f := range sent {
+		f.Handler.OnLost(f.Frame)
+		check()
+	}
+	str.SetBoost(true)
+	str.SetBoost(false)
+	check()
+	for {
+		f, _, more, _, _ := str.popClassedStreamFrame(60, str.streamClass(), protocol.Version1)
+		check()
+		if f.Frame == nil && !more {
+			break
+		}
+		if f.Frame == nil {
+			break
+		}
+	}
+	str.CancelWrite(1)
+	check()
 }

@@ -47,7 +47,10 @@ type framer struct {
 	ringOf     map[protocol.StreamID]ringEntry
 	liveIn     [congestion.NumSendClasses]int
 	serving    bool // a ring is being served; no compaction meanwhile
-	ringGen    uint64
+	// heldStreamControl are streams' control frames taken by a CONTROL pass
+	// whose allowance they did not fit; they go first in a later one.
+	heldStreamControl []ackhandler.Frame
+	ringGen           uint64
 
 	controlFrameMutex sync.Mutex
 	controlFrames     []wire.Frame
@@ -76,7 +79,7 @@ func (f *framer) HasData() bool {
 	}
 	f.controlFrameMutex.Lock()
 	defer f.controlFrameMutex.Unlock()
-	return len(f.streamsWithControlFrames) > 0 || len(f.controlFrames) > 0 || len(f.pathResponses) > 0 || len(f.exemptFrames) > 0
+	return len(f.streamsWithControlFrames) > 0 || len(f.controlFrames) > 0 || len(f.pathResponses) > 0 || len(f.exemptFrames) > 0 || len(f.heldStreamControl) > 0
 }
 
 // QueueExemptFrame queues a frame that may be sent without a permit. Its
@@ -102,7 +105,7 @@ func (f *framer) HasExemptData() bool {
 func (f *framer) HasControlData() bool {
 	f.controlFrameMutex.Lock()
 	defer f.controlFrameMutex.Unlock()
-	return len(f.streamsWithControlFrames) > 0 || len(f.controlFrames) > 0
+	return len(f.streamsWithControlFrames) > 0 || len(f.controlFrames) > 0 || len(f.heldStreamControl) > 0
 }
 
 // HasStreamData says whether a queued stream could send a frame now. It
@@ -294,6 +297,14 @@ func (f *framer) appendStreamControlFramesBelow(
 	now monotime.Time,
 	v protocol.Version,
 ) ([]ackhandler.Frame, protocol.ByteCount) {
+	// Frames a class-scheduled pass held (empty unless the connection
+	// scheduled classes) go first.
+	for len(f.heldStreamControl) > 0 && maxLen-length > maxFrame {
+		fr := f.heldStreamControl[0]
+		frames = append(frames, fr)
+		length += fr.Frame.Length(v)
+		f.heldStreamControl = f.heldStreamControl[1:]
+	}
 	// add stream-related control frames
 	for id, str := range f.streamsWithControlFrames {
 	start:
@@ -405,6 +416,7 @@ func (f *framer) Handle0RTTRejection() {
 	clear(f.ringOf)
 	f.liveIn = [congestion.NumSendClasses]int{}
 	clear(f.streamsWithControlFrames)
+	f.heldStreamControl = nil
 	var j int
 	for i, frame := range f.controlFrames {
 		switch frame.(type) {

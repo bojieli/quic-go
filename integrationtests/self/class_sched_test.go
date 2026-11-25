@@ -178,8 +178,12 @@ func TestClassScheduledPacketsCarryOnlyTheirTurn(t *testing.T) {
 		return c.attached == 1
 	}, time.Second, time.Millisecond)
 
-	// Permits are executed from handshake confirmation on: wait for the
-	// first packet built under one.
+	// Permits are executed from handshake confirmation on: queue a small
+	// BULK warm-up write, and wait for a packet built under one.
+	warmup, err := client.OpenUniStream()
+	require.NoError(t, err)
+	_, err = warmup.WriteClass([]byte("warm-up"), congestion.ClassBulk)
+	require.NoError(t, err)
 	require.Eventually(t, func() bool {
 		c.mu.Lock()
 		defer c.mu.Unlock()

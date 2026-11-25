@@ -481,3 +481,70 @@ func TestClassedFramerIgnoresStaleEntriesForHasData(t *testing.T) {
 	require.Len(t, sfs, 1)
 	require.False(t, h.framer.HasData())
 }
+
+// Item 1: a small CONTROL allowance carries a small MAX_STREAM_DATA; a frame
+// too large for it is held and goes first when there is room.
+func TestClassedControlPassSizesStreamControlFramesExactly(t *testing.T) {
+	h := newBuilderHarness(true)
+	small := &fakeControlStream{frames: []wire.Frame{&wire.MaxStreamDataFrame{StreamID: 4, MaximumStreamData: 1000}}}
+	h.framer.AddStreamWithControlFrames(4, small)
+	frames, _, n := h.framer.AppendClass(nil, nil, congestion.ClassControl, 32, false, monotime.Now(), protocol.Version1)
+	require.Len(t, frames, 1, "a 32-byte allowance carries a small MAX_STREAM_DATA")
+	require.LessOrEqual(t, n, protocol.ByteCount(32))
+
+	big := &fakeControlStream{frames: []wire.Frame{&wire.ResetStreamFrame{StreamID: 1 << 60, ErrorCode: 1 << 60, FinalSize: 1 << 60}}}
+	h.framer.AddStreamWithControlFrames(8, big)
+	frames, _, _ = h.framer.AppendClass(nil, nil, congestion.ClassControl, 10, false, monotime.Now(), protocol.Version1)
+	require.Empty(t, frames, "a frame larger than the allowance is not sent")
+	require.True(t, h.framer.HasControlData(), "it is held, not lost")
+	frames, _, _ = h.framer.AppendClass(nil, nil, congestion.ClassControl, 100, false, monotime.Now(), protocol.Version1)
+	require.Len(t, frames, 1)
+	require.IsType(t, &wire.ResetStreamFrame{}, frames[0].Frame)
+}
+
+type fakeControlStream struct{ frames []wire.Frame }
+
+func (s *fakeControlStream) getControlFrame(monotime.Time) (ackhandler.Frame, bool, bool) {
+	if len(s.frames) == 0 {
+		return ackhandler.Frame{}, false, false
+	}
+	f := s.frames[0]
+	s.frames = s.frames[1:]
+	return ackhandler.Frame{Frame: f}, true, len(s.frames) > 0
+}
+
+// Item 2: a fill smaller than 16 bytes still carries a short offset-zero
+// STREAM frame, or a FIN, and never more than it allows.
+func TestClassedFramerServesSubSixteenByteFills(t *testing.T) {
+	h := newBuilderHarness(true)
+	str := h.stream(4)
+	writeClassBuffered(t, str, 1, congestion.ClassBulk)
+	_, sfs, n := h.framer.AppendClass(nil, nil, congestion.ClassBulk, 8, false, monotime.Now(), protocol.Version1)
+	require.Len(t, sfs, 1, "an 8-byte fill carries a one-byte offset-zero STREAM frame")
+	require.LessOrEqual(t, n, protocol.ByteCount(8))
+
+	require.NoError(t, str.Close())
+	_, sfs, _ = h.framer.AppendClass(nil, nil, congestion.ClassBulk, 2, false, monotime.Now(), protocol.Version1)
+	require.Empty(t, sfs, "a FIN that does not fit is not sent")
+	_, sfs, n = h.framer.AppendClass(nil, nil, congestion.ClassBulk, 8, false, monotime.Now(), protocol.Version1)
+	require.Len(t, sfs, 1)
+	require.True(t, sfs[0].Frame.Fin, "an 8-byte fill carries the FIN")
+	require.LessOrEqual(t, n, protocol.ByteCount(8))
+}
+
+// Item 3: notifications deferred to a CONTROL pass are coalesced: one per
+// stream, however many BULK turns block the stream again first.
+func TestClassedFramerCoalescesDeferredNotifications(t *testing.T) {
+	h := newBuilderHarness(true)
+	str := newSendStream(context.Background(), 4, framerSender{h.framer}, newTestStreamFlowControllerWithSendWindow(4, 10), false)
+	for i := range 200 {
+		writeClassBuffered(t, str, 10, congestion.ClassBulk)
+		_, sfs, _ := h.framer.AppendClass(nil, nil, congestion.ClassBulk, 1200, true, monotime.Now(), protocol.Version1)
+		require.Len(t, sfs, 1)
+		str.updateSendWindow(protocol.ByteCount(10 * (i + 2))) // the peer grants more; CONTROL gets no turn
+	}
+	h.framer.controlFrameMutex.Lock()
+	queued := len(h.framer.controlFrames)
+	h.framer.controlFrameMutex.Unlock()
+	require.LessOrEqual(t, queued, 2, "deferred notifications accumulate")
+}
