@@ -3,6 +3,7 @@ package quic
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -514,6 +515,66 @@ func (s *SendStream) popNewStreamFrame(maxDataLen protocol.ByteCount) (_ *wire.S
 	s.getDataForWriting(f, maxDataLen)
 	return f, s.dataForWriting != nil || s.nextFrame != nil || s.finishedWriting
 }
+
+// AcceptedOffset is the stream offset of the next byte a write will accept:
+// every byte before it has been accepted by the stream.
+func (s *SendStream) AcceptedOffset() protocol.ByteCount {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	n := s.writeOffset + protocol.ByteCount(len(s.dataForWriting))
+	if s.nextFrame != nil {
+		n += s.nextFrame.DataLen()
+	}
+	return n
+}
+
+// popGrantedStreamFrame pops a frame that carries only bytes of [start, end):
+// a queued retransmission inside the range first, then new data at the write
+// offset. It is the verification grant's build path.
+func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCount, v protocol.Version) ackhandler.StreamFrame {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if s.shutdownErr != nil || s.resetErr != nil {
+		return ackhandler.StreamFrame{}
+	}
+	limit := func(offset protocol.ByteCount) protocol.ByteCount {
+		header := (&wire.StreamFrame{StreamID: s.streamID, Offset: offset, DataLenPresent: true}).Length(v)
+		return min(maxBytes, header+end-offset)
+	}
+	for i, f := range s.retransmissionQueue {
+		if f.Offset < start || f.Offset >= end {
+			continue
+		}
+		size := limit(f.Offset)
+		newFrame, needsSplit := f.MaybeSplitOffFrame(size, v)
+		if needsSplit {
+			if newFrame == nil {
+				return ackhandler.StreamFrame{}
+			}
+			s.numOutstandingFrames++
+			return ackhandler.StreamFrame{Frame: newFrame, Handler: (*sendStreamAckHandler)(s)}
+		}
+		s.retransmissionQueue = slices.Delete(s.retransmissionQueue, i, i+1)
+		s.numOutstandingFrames++
+		return ackhandler.StreamFrame{Frame: f, Handler: (*sendStreamAckHandler)(s)}
+	}
+	if s.writeOffset < start || s.writeOffset >= end {
+		return ackhandler.StreamFrame{}
+	}
+	// New data only: retransmissions outside the range stay queued.
+	queued := s.retransmissionQueue
+	s.retransmissionQueue = nil
+	f, _, _ := s.popNewOrRetransmittedStreamFrame(limit(s.writeOffset), v)
+	s.retransmissionQueue = queued
+	if f == nil {
+		return ackhandler.StreamFrame{}
+	}
+	s.numOutstandingFrames++
+	return ackhandler.StreamFrame{Frame: f, Handler: (*sendStreamAckHandler)(s)}
+}
+
+// grantSendStream makes a SendStream a GrantableStream.
+func (s *SendStream) grantSendStream() *SendStream { return s }
 
 func (s *SendStream) maybeGetRetransmission(maxBytes protocol.ByteCount, v protocol.Version) (*wire.StreamFrame, bool /* has more retransmissions */) {
 	f := s.retransmissionQueue[0]

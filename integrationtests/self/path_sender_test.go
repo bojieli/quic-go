@@ -298,3 +298,111 @@ func TestReplacingAPathSender(t *testing.T) {
 	_, err = io.ReadFull(cstr, buf)
 	require.NoError(t, err)
 }
+
+func (g *gatePathSender) granted() map[uint64]int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	m := make(map[uint64]int)
+	for _, p := range g.sent {
+		if p.Grant != 0 {
+			if p.Kind != congestion.KindVerification || !p.Exempt {
+				panic("a granted packet must be an exempt verification packet")
+			}
+			m[p.Grant]++
+		}
+	}
+	return m
+}
+
+func readWithin(t *testing.T, str *quic.ReceiveStream, n int, d time.Duration) ([]byte, error) {
+	t.Helper()
+	_ = str.SetReadDeadline(time.Now().Add(d))
+	buf := make([]byte, n)
+	m, err := io.ReadFull(str, buf)
+	return buf[:m], err
+}
+
+// A verification grant lets the bytes it is bound to -- and only those --
+// cross a connection whose controller refuses every ordinary packet. A grant
+// that has expired by the time the builder runs covers nothing; a reissued
+// grant does, under its own ID.
+func TestVerificationGrantWhileWindowBlocked(t *testing.T) {
+	client, server := dialPathSenderPair(t, &quic.Config{})
+	g := &gatePathSender{}
+	installPathSender(t, client, g)
+	g.blocked.Store(true)
+
+	probe := make([]byte, 3000) // several packets
+	for i := range probe {
+		probe[i] = byte(i)
+	}
+	str, err := client.OpenUniStream()
+	require.NoError(t, err)
+	unrelated, err := client.OpenUniStream()
+	require.NoError(t, err)
+
+	// Delayed builder: the grant expires before anything is built.
+	start := str.AcceptedOffset()
+	require.NoError(t, client.BindVerificationGrant(str, congestion.VerificationGrant{
+		ID: 1, Start: congestion.ByteCount(start), End: congestion.ByteCount(start) + 3000, Budget: 64 << 10, Expiry: monotime.Now(),
+	}))
+	// Writes return once their bytes are packed, which here only a grant
+	// allows.
+	go func() { _, _ = str.Write(probe) }()
+	go func() { _, _ = unrelated.Write([]byte("not covered by any grant")) }()
+	time.Sleep(200 * time.Millisecond)
+	require.Empty(t, g.granted(), "an expired grant covers nothing")
+
+	// Reissue.
+	require.NoError(t, client.BindVerificationGrant(str, congestion.VerificationGrant{
+		ID: 2, Start: congestion.ByteCount(start), End: congestion.ByteCount(start) + 3000, Budget: 64 << 10, Expiry: monotime.Now().Add(5 * time.Second),
+	}))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rstr, err := server.AcceptUniStream(ctx)
+	require.NoError(t, err)
+	got, err := readWithin(t, rstr, len(probe), 3*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, probe, got)
+	granted := g.granted()
+	require.Zero(t, granted[1])
+	require.Positive(t, granted[2])
+
+	// The unrelated stream was never sent: accepting it times out.
+	actx, acancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer acancel()
+	if other, err := server.AcceptUniStream(actx); err == nil {
+		data, _ := readWithin(t, other, 1, 100*time.Millisecond)
+		require.Empty(t, data, "bytes outside the grant crossed a blocked connection")
+	}
+}
+
+// A grant's budget bounds the packet bytes it covers.
+func TestVerificationGrantBudget(t *testing.T) {
+	client, server := dialPathSenderPair(t, &quic.Config{})
+	g := &gatePathSender{}
+	installPathSender(t, client, g)
+	g.blocked.Store(true)
+	str, err := client.OpenUniStream()
+	require.NoError(t, err)
+	require.NoError(t, client.BindVerificationGrant(str, congestion.VerificationGrant{
+		ID: 7, Start: 0, End: 5000, Budget: 1300, Expiry: monotime.Now().Add(5 * time.Second),
+	}))
+	go func() { _, _ = str.Write(make([]byte, 5000)) }()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	rstr, err := server.AcceptUniStream(ctx)
+	require.NoError(t, err)
+	got, _ := readWithin(t, rstr, 5000, 300*time.Millisecond)
+	require.NotEmpty(t, got)
+	require.Less(t, len(got), 1300)
+	var bytes congestion.ByteCount
+	g.mu.Lock()
+	for _, p := range g.sent {
+		if p.Grant == 7 {
+			bytes += p.Bytes
+		}
+	}
+	g.mu.Unlock()
+	require.LessOrEqual(t, bytes, congestion.ByteCount(1300))
+}

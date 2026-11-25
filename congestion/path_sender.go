@@ -52,6 +52,9 @@ const (
 	KindHandshake
 	// KindLiveness carries a keep-alive PING and nothing ordinary.
 	KindLiveness
+	// KindVerification carries stream bytes covered by a verification grant,
+	// built without a permit.
+	KindVerification
 )
 
 func (k PacketKind) String() string {
@@ -72,6 +75,8 @@ func (k PacketKind) String() string {
 		return "handshake"
 	case KindLiveness:
 		return "liveness"
+	case KindVerification:
+		return "verification"
 	default:
 		return "unknown"
 	}
@@ -152,6 +157,9 @@ type SentPacket struct {
 	// InFlight is this connection's bytes in flight after this packet.
 	InFlight ByteCount
 	Time     monotime.Time
+	// Grant is the ID of the verification grant the packet was built under,
+	// or zero.
+	Grant uint64
 }
 
 // PacketRef names one packet.
@@ -200,4 +208,20 @@ type PathSender interface {
 	// addresses. The controller stays installed.
 	OnPathMigrated(now monotime.Time, oldLocal, newLocal, oldRemote, newRemote net.Addr)
 	OnDetach(now monotime.Time)
+}
+
+// VerificationGrant is the one reservation of the design: an admission
+// opportunity for a recovery transaction's verification exchange, issued to
+// one connection at a time, that is gated by neither the window nor the
+// balance. It covers the stream bytes [Start, End) of the stream it is bound
+// to (see Conn.BindVerificationGrant), including their retransmissions, and
+// the QUIC packets that carry them, up to Budget packet bytes, until Expiry.
+// Packets built under it are reported with its ID and settled at OnSent like
+// any other. Binding another grant to the connection reissues: the earlier
+// one covers nothing from then on.
+type VerificationGrant struct {
+	ID         uint64 // nonzero
+	Start, End ByteCount
+	Budget     ByteCount
+	Expiry     monotime.Time
 }

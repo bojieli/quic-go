@@ -192,6 +192,42 @@ func (c *MockSentPacketHandlerECNModeCall) DoAndReturn(f func(bool) protocol.ECN
 	return c
 }
 
+// ExpectGrantedPacket mocks base method.
+func (m *MockSentPacketHandler) ExpectGrantedPacket(id uint64) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "ExpectGrantedPacket", id)
+}
+
+// ExpectGrantedPacket indicates an expected call of ExpectGrantedPacket.
+func (mr *MockSentPacketHandlerMockRecorder) ExpectGrantedPacket(id any) *MockSentPacketHandlerExpectGrantedPacketCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ExpectGrantedPacket", reflect.TypeOf((*MockSentPacketHandler)(nil).ExpectGrantedPacket), id)
+	return &MockSentPacketHandlerExpectGrantedPacketCall{Call: call}
+}
+
+// MockSentPacketHandlerExpectGrantedPacketCall wrap *gomock.Call
+type MockSentPacketHandlerExpectGrantedPacketCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockSentPacketHandlerExpectGrantedPacketCall) Return() *MockSentPacketHandlerExpectGrantedPacketCall {
+	c.Call = c.Call.Return()
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockSentPacketHandlerExpectGrantedPacketCall) Do(f func(uint64)) *MockSentPacketHandlerExpectGrantedPacketCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockSentPacketHandlerExpectGrantedPacketCall) DoAndReturn(f func(uint64)) *MockSentPacketHandlerExpectGrantedPacketCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
 // ExpectLivenessPing mocks base method.
 func (m *MockSentPacketHandler) ExpectLivenessPing() {
 	m.ctrl.T.Helper()

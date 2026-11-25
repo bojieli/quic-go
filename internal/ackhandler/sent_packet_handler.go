@@ -113,13 +113,18 @@ type sentPacketHandler struct {
 	// carries a PING and nothing else ack-eliciting is labelled a liveness
 	// packet.
 	livenessPending bool
+	// grantPending is the verification grant the next packet was built
+	// under, or zero.
+	grantPending uint64
 	// discardRefs is scratch space for OnDiscarded.
 	discardRefs []congestionExt.PacketRef
 	// lateAcks holds the ack-eliciting application packets declared lost,
 	// for the horizon of the lost-packet tracker. A later acknowledgement of
 	// one is transport progress and, if it was reported lost to the installed
 	// PathSender, a correction of exactly that reference.
-	lateAcks map[protocol.PacketNumber]lostRecord
+	// It is sorted by packet number and pruned from the front, so matching an
+	// ACK against it is linear in the ACK's ranges and the records it covers.
+	lateAcks []lostRecord
 	// controllerGen identifies the installed PathSender.
 	controllerGen uint32
 	// appInFlight is the application-data part of bytesInFlight.
@@ -162,6 +167,7 @@ type sentPacketHandler struct {
 var _ SentPacketHandler = &sentPacketHandler{}
 
 type lostRecord struct {
+	pn       protocol.PacketNumber
 	size     protocol.ByteCount
 	sent     monotime.Time
 	reported bool   // to a PathSender
@@ -396,7 +402,14 @@ func (h *sentPacketHandler) SentPacket(
 
 	if ps != nil {
 		kind := h.packetKind(encLevel, p, isAckEliciting, isProbe)
-		ps.OnSent(h.sentPacketInfo(t, encLevel, pn, p, kind, !underPermit))
+		grant := h.grantPending
+		h.grantPending = 0
+		if grant != 0 {
+			kind = congestionExt.KindVerification
+		}
+		info := h.sentPacketInfo(t, encLevel, pn, p, kind, !underPermit)
+		info.Grant = grant
+		ps.OnSent(info)
 	} else {
 		cc.OnPacketSent(t, h.bytesInFlight, pn, size, isAckEliciting)
 	}
@@ -695,21 +708,40 @@ func (h *sentPacketHandler) creditLateAcks(ack *wire.AckFrame, rcvTime monotime.
 	}
 	horizon := rcvTime.Add(-3 * h.rttStats.PTO(false))
 	var refs []congestionExt.PacketRef
-	for pn, r := range h.lateAcks {
-		if ack.AcksPacket(pn) {
-			delete(h.lateAcks, pn)
+	kept := h.lateAcks[:0]
+	ri := len(ack.AckRanges) - 1 // ranges are in descending order
+	for _, r := range h.lateAcks {
+		for ri >= 0 && ack.AckRanges[ri].Largest < r.pn {
+			ri--
+		}
+		if ri >= 0 && ack.AckRanges[ri].Smallest <= r.pn {
 			h.progress.Epoch++
 			h.progress.Last = rcvTime
 			h.progress.PTOExpiries = 0
 			if ps != nil && r.reported && r.gen == h.controllerGen {
-				refs = append(refs, congestionExt.PacketRef{Space: congestionExt.SpaceApplication, Number: congestionExt.PacketNumber(pn), Bytes: congestionExt.ByteCount(r.size)})
+				refs = append(refs, congestionExt.PacketRef{Space: congestionExt.SpaceApplication, Number: congestionExt.PacketNumber(r.pn), Bytes: congestionExt.ByteCount(r.size)})
 			}
-		} else if r.sent.Before(horizon) {
-			delete(h.lateAcks, pn)
+			continue
 		}
+		if r.sent.Before(horizon) {
+			continue
+		}
+		kept = append(kept, r)
 	}
-	slices.SortFunc(refs, func(a, b congestionExt.PacketRef) int { return cmp.Compare(a.Number, b.Number) })
+	clear(h.lateAcks[len(kept):])
+	h.lateAcks = kept
 	return refs
+}
+
+// recordLateAck remembers an ack-eliciting application packet that left the
+// flight without a fate known to be final.
+func (h *sentPacketHandler) recordLateAck(r lostRecord) {
+	i, _ := slices.BinarySearchFunc(h.lateAcks, r.pn, func(e lostRecord, pn protocol.PacketNumber) int { return cmp.Compare(e.pn, pn) })
+	if i < len(h.lateAcks) && h.lateAcks[i].pn == r.pn {
+		h.lateAcks[i] = r
+		return
+	}
+	h.lateAcks = slices.Insert(h.lateAcks, i, r)
 }
 
 // Packets are returned in ascending packet number order.
@@ -1055,10 +1087,7 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 					BytesLost:    congestionExt.ByteCount(p.Length),
 				})
 				if encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT {
-					if h.lateAcks == nil {
-						h.lateAcks = make(map[protocol.PacketNumber]lostRecord)
-					}
-					h.lateAcks[pn] = lostRecord{size: p.Length, sent: p.SendTime, reported: ps != nil, gen: h.controllerGen}
+					h.recordLateAck(lostRecord{pn: pn, size: p.Length, sent: p.SendTime, reported: ps != nil, gen: h.controllerGen})
 				}
 				if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
 					h.ecnTracker.LostPacket(pn)
@@ -1220,6 +1249,11 @@ func (h *sentPacketHandler) PopPacketNumber(encLevel protocol.EncryptionLevel) p
 }
 
 func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
+	cc, ps := h.getControllers()
+	if ps != nil {
+		// A permit covers only the build that follows the Admit that issued it.
+		h.permit = congestionExt.Permit{}
+	}
 	numTrackedPackets := h.appDataPackets.history.Len()
 	if h.initialPackets != nil {
 		numTrackedPackets += h.initialPackets.history.Len()
@@ -1245,7 +1279,6 @@ func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
 	if h.numProbesToSend > 0 {
 		return h.ptoMode
 	}
-	cc, ps := h.getControllers()
 	if ps != nil {
 		return h.pathSenderSendMode(ps, now, numTrackedPackets)
 	}
@@ -1328,6 +1361,10 @@ func (h *sentPacketHandler) QueueProbePacket(encLevel protocol.EncryptionLevel) 
 	// Call DeclareLost before queueFramesForRetransmission, which clears the packet's frames.
 	pnSpace.history.DeclareLost(pn)
 	wasInFlight := p.includedInBytesInFlight
+	if (encLevel == protocol.Encryption1RTT || encLevel == protocol.Encryption0RTT) && p.IsAckEliciting() && !p.isPathProbePacket {
+		// It may still be acknowledged: that is progress, not a correction.
+		h.recordLateAck(lostRecord{pn: pn, size: p.Length, sent: p.SendTime})
+	}
 	h.removeFromBytesInFlight(p)
 	if ps := h.getPathSender(); ps != nil && wasInFlight {
 		refs := append(h.discardRefs[:0], packetRef(encLevel, pn, p.Length))
@@ -1512,7 +1549,7 @@ func (h *sentPacketHandler) InstallPathSender(ps congestionExt.PathSender, now m
 	h.congestionMutex.RLock()
 	old := h.pathSender
 	h.congestionMutex.RUnlock()
-	if old != nil && old != ps {
+	if old != nil {
 		old.OnDetach(now)
 	}
 	// OnAttach is the new controller's first call.
@@ -1539,6 +1576,10 @@ func (h *sentPacketHandler) DetachPathSender(now monotime.Time) {
 
 // ExpectLivenessPing says a keep-alive PING has been queued.
 func (h *sentPacketHandler) ExpectLivenessPing() { h.livenessPending = true }
+
+// ExpectGrantedPacket says the next packet was built under a verification
+// grant.
+func (h *sentPacketHandler) ExpectGrantedPacket(id uint64) { h.grantPending = id }
 
 // BytesInFlight returns the connection's bytes in flight.
 func (h *sentPacketHandler) BytesInFlight() protocol.ByteCount { return h.bytesInFlight }

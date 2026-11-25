@@ -233,10 +233,16 @@ type Conn struct {
 	pendingController congestion.CongestionControl
 	hasPendingInstall atomic.Bool
 	hasPathSender     atomic.Bool
+	hasPendingGrant   atomic.Bool
 	pathSender        congestion.PathSender
 	demand            congestion.Demand
 
 	datagramObserver atomic.Pointer[func(tag uint64, outcome DatagramOutcome)]
+
+	// pendingGrant is a verification grant waiting to be bound on the run
+	// loop (under pathSenderMx); grant is the bound one, run loop only.
+	pendingGrant *boundGrant
+	grant        *boundGrant
 
 	datagramQueue *datagramQueue
 
@@ -788,17 +794,18 @@ runLoop:
 		}
 	}
 
-	c.pathSenderMx.Lock()
+	closeErr := c.closeErr.Load()
+	c.cryptoStreamHandler.Close()
+	c.sendQueue.Close() // close the send queue before sending the CONNECTION_CLOSE
+	c.handleCloseError(closeErr)
+	// Detach once the CONNECTION_CLOSE is built, which may still ask the
+	// controller for its window, and outside any lock: OnDetach is the
+	// controller's code.
 	if c.pathSender != nil {
 		c.sentPacketHandler.DetachPathSender(monotime.Now())
 		c.pathSender = nil
 		c.hasPathSender.Store(false)
 	}
-	c.pathSenderMx.Unlock()
-	closeErr := c.closeErr.Load()
-	c.cryptoStreamHandler.Close()
-	c.sendQueue.Close() // close the send queue before sending the CONNECTION_CLOSE
-	c.handleCloseError(closeErr)
 	if c.qlogger != nil {
 		if e := (&errCloseForRecreating{}); !errors.As(closeErr.err, &e) {
 			c.qlogger.Close()
@@ -984,30 +991,45 @@ func (c *Conn) applyPendingSettings(now monotime.Time) {
 		c.keepAliveFloor = floor
 		c.keepAliveStep = 0
 	}
+	if c.hasPendingGrant.Load() {
+		c.pathSenderMx.Lock()
+		c.grant, c.pendingGrant = c.pendingGrant, nil
+		c.hasPendingGrant.Store(false)
+		c.pathSenderMx.Unlock()
+	}
 	if !c.hasPendingInstall.Load() {
 		return
 	}
-	// The installation completes under the mutex, so a concurrent
-	// SetCongestionControl either queues behind it or sees its result.
+	// The request stays pending until the installation is published, so a
+	// concurrent SetCongestionControl queues behind it. The controllers'
+	// callbacks (OnAttach, OnDetach) run outside the mutex: they may call
+	// SetCongestionControl themselves.
 	c.pathSenderMx.Lock()
-	defer c.pathSenderMx.Unlock()
 	cc := c.pendingController
 	c.pendingController = nil
-	c.hasPendingInstall.Store(false)
 	if cc == nil {
+		c.hasPendingInstall.Store(false)
+		c.pathSenderMx.Unlock()
 		return
 	}
-	ps, ok := cc.(congestion.PathSender)
-	if !ok {
+	c.pathSenderMx.Unlock()
+	ps, isPathSender := cc.(congestion.PathSender)
+	if isPathSender {
+		c.sentPacketHandler.InstallPathSender(ps, now, c.scheduleSending)
+		c.pathSender = ps
+		c.demand = congestion.Demand{}
+	} else {
 		c.sentPacketHandler.SetCongestionControl(cc)
 		c.pathSender = nil
-		c.hasPathSender.Store(false)
-		return
 	}
-	c.sentPacketHandler.InstallPathSender(ps, now, c.scheduleSending)
-	c.pathSender = ps
-	c.hasPathSender.Store(true)
-	c.demand = congestion.Demand{}
+	c.pathSenderMx.Lock()
+	c.hasPathSender.Store(isPathSender)
+	if c.pendingController == nil {
+		c.hasPendingInstall.Store(false)
+	} else {
+		c.scheduleSending()
+	}
+	c.pathSenderMx.Unlock()
 }
 
 func (c *Conn) maybeResetTimer() {
@@ -2430,9 +2452,8 @@ func (c *Conn) handleCloseError(closeErr *closeError) {
 
 	c.streamsMap.CloseWithError(e)
 	if c.datagramQueue != nil {
-		c.datagramQueue.CloseWithError(e)
-		if c.datagramObserver.Load() != nil {
-			c.datagramQueue.DiscardQueued(func(f *wire.DatagramFrame) { c.observeDatagram(f, DatagramDiscarded) })
+		for _, f := range c.datagramQueue.CloseWithError(e) {
+			c.observeDatagram(f, DatagramDiscarded)
 		}
 	}
 
@@ -2716,16 +2737,79 @@ func (c *Conn) maybeSendExemptPacket(now monotime.Time) error {
 		return err
 	}
 	ecn := c.sentPacketHandler.ECNMode(true)
-	p, buf, err := c.packer.PackExemptPacket(c.maxPacketSize(), now, c.version)
+	maxSize := c.maxPacketSize()
+	var granted func(protocol.ByteCount, protocol.Version) ackhandler.StreamFrame
+	var grantedFrame bool
+	if g := c.grant; g != nil {
+		if !now.Before(g.grant.Expiry) || g.remaining <= 0 {
+			// Expired or spent: it covers nothing any more.
+			c.grant = nil
+		} else {
+			granted = func(maxLen protocol.ByteCount, v protocol.Version) ackhandler.StreamFrame {
+				// Whatever the packet already holds -- header, AEAD tag, ACK,
+				// exempt frames -- is charged to the grant too.
+				committed := maxSize - maxLen
+				if protocol.ByteCount(g.remaining) <= committed+protocol.MinStreamFrameSize {
+					return ackhandler.StreamFrame{}
+				}
+				maxLen = min(maxLen, protocol.ByteCount(g.remaining)-committed)
+				sf := g.str.popGrantedStreamFrame(maxLen, protocol.ByteCount(g.grant.Start), protocol.ByteCount(g.grant.End), v)
+				grantedFrame = sf.Frame != nil
+				return sf
+			}
+		}
+	}
+	p, buf, err := c.packer.PackExemptPacket(maxSize, now, granted, c.version)
 	if err != nil {
 		if err == errNothingToPack {
 			return nil
 		}
 		return err
 	}
+	if grantedFrame {
+		c.grant.remaining -= congestion.ByteCount(p.Length)
+		c.sentPacketHandler.ExpectGrantedPacket(c.grant.grant.ID)
+		// The exchange may need more packets.
+		c.scheduleSending()
+	}
 	c.logShortHeaderPacket(p, ecn, buf.Len())
 	c.registerPackedShortHeaderPacket(p, ecn, now)
 	c.sendQueue.Send(buf, 0, ecn)
+	return nil
+}
+
+// boundGrant is a verification grant bound to a stream.
+type boundGrant struct {
+	grant     congestion.VerificationGrant
+	str       *SendStream
+	remaining congestion.ByteCount
+}
+
+// GrantableStream is a stream a verification grant can be bound to: a
+// *SendStream or a *Stream.
+type GrantableStream interface{ grantSendStream() *SendStream }
+
+// BindVerificationGrant binds a verification grant to the byte range
+// [g.Start, g.End) of str, which SendStream.AcceptedOffset helps to name.
+// While the grant is live and its budget lasts, and only while the
+// connection's PathSender refuses admission, the connection may build packets
+// that carry those bytes (and their retransmissions) and the exempt
+// obligations, and nothing else; each is reported to the PathSender with the
+// grant's ID. Binding another grant replaces this one. It has no effect
+// without a PathSender, and changes nothing on the wire.
+func (c *Conn) BindVerificationGrant(str GrantableStream, g congestion.VerificationGrant) error {
+	if g.ID == 0 || g.End <= g.Start || g.Budget <= 0 {
+		return errors.New("invalid verification grant")
+	}
+	s := str.grantSendStream()
+	if s == nil {
+		return errors.New("verification grant needs a send stream")
+	}
+	c.pathSenderMx.Lock()
+	c.pendingGrant = &boundGrant{grant: g, str: s, remaining: g.Budget}
+	c.hasPendingGrant.Store(true)
+	c.pathSenderMx.Unlock()
+	c.scheduleSending()
 	return nil
 }
 
@@ -3035,7 +3119,7 @@ func (c *Conn) registerPackedShortHeaderPacket(p shortHeaderPacket, ecn protocol
 	if len(p.StreamFrames) > 0 {
 		c.noteApplicationPayload()
 	}
-	if c.keepAliveFloor > 0 || c.datagramObserver.Load() != nil {
+	if c.keepAliveFloor > 0 || c.datagramObserver.Load() != nil || (c.datagramQueue != nil && c.datagramQueue.hasPopped()) {
 		c.registeredDatagrams(p.Frames)
 	}
 
@@ -3080,7 +3164,7 @@ func (c *Conn) sendPackedCoalescedPacket(packet *coalescedPacket, ecn protocol.E
 			false,
 			false,
 		)
-		if c.keepAliveFloor > 0 || c.datagramObserver.Load() != nil {
+		if c.keepAliveFloor > 0 || c.datagramObserver.Load() != nil || (c.datagramQueue != nil && c.datagramQueue.hasPopped()) {
 			c.registeredDatagrams(p.frames)
 		}
 		if c.perspective == protocol.PerspectiveClient && p.EncryptionLevel() == protocol.EncryptionHandshake &&
@@ -3115,7 +3199,7 @@ func (c *Conn) sendPackedCoalescedPacket(packet *coalescedPacket, ecn protocol.E
 		if len(p.StreamFrames) > 0 {
 			c.noteApplicationPayload()
 		}
-		if c.keepAliveFloor > 0 || c.datagramObserver.Load() != nil {
+		if c.keepAliveFloor > 0 || c.datagramObserver.Load() != nil || (c.datagramQueue != nil && c.datagramQueue.hasPopped()) {
 			c.registeredDatagrams(p.Frames)
 		}
 	}
@@ -3374,7 +3458,9 @@ func (c *Conn) registeredDatagrams(frames []ackhandler.Frame) {
 	for _, f := range frames {
 		if df, ok := f.Frame.(*wire.DatagramFrame); ok {
 			c.noteApplicationPayload()
-			c.observeDatagram(df, DatagramRegistered)
+			if df.Tagged && c.datagramQueue.Registered(df) {
+				c.observeDatagram(df, DatagramRegistered)
+			}
 		}
 	}
 }

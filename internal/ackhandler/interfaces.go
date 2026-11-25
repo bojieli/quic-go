@@ -50,6 +50,9 @@ type SentPacketHandler interface {
 	DetachPathSender(now monotime.Time)
 	// ExpectLivenessPing says a keep-alive PING has been queued.
 	ExpectLivenessPing()
+	// ExpectGrantedPacket says the next packet registered was built under the
+	// verification grant with this ID.
+	ExpectGrantedPacket(id uint64)
 	// BytesInFlight returns the connection's bytes in flight.
 	BytesInFlight() protocol.ByteCount
 }

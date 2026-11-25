@@ -23,7 +23,9 @@ type packer interface {
 	// PackExemptPacket packs a packet that carries only exempt obligations:
 	// an ACK, and queued exempt frames such as a liveness PING or a
 	// PATH_RESPONSE.
-	PackExemptPacket(maxPacketSize protocol.ByteCount, now monotime.Time, v protocol.Version) (shortHeaderPacket, *packetBuffer, error)
+	// granted, if not nil, supplies a stream frame covered by a verification
+	// grant that fits the given length.
+	PackExemptPacket(maxPacketSize protocol.ByteCount, now monotime.Time, granted func(maxLen protocol.ByteCount, v protocol.Version) ackhandler.StreamFrame, v protocol.Version) (shortHeaderPacket, *packetBuffer, error)
 	AppendPacket(_ *packetBuffer, maxPacketSize protocol.ByteCount, now monotime.Time, v protocol.Version) (shortHeaderPacket, error)
 	PackPTOProbePacket(_ protocol.EncryptionLevel, _ protocol.ByteCount, addPingIfEmpty bool, now monotime.Time, v protocol.Version) (*coalescedPacket, error)
 	PackConnectionClose(*qerr.TransportError, protocol.ByteCount, protocol.Version) (*coalescedPacket, error)
@@ -519,7 +521,7 @@ func (p *packetPacker) PackAckOnlyPacket(maxSize protocol.ByteCount, now monotim
 
 // AppendPacket packs a packet in the application data packet number space.
 // It should be called after the handshake is confirmed.
-func (p *packetPacker) PackExemptPacket(maxSize protocol.ByteCount, now monotime.Time, v protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
+func (p *packetPacker) PackExemptPacket(maxSize protocol.ByteCount, now monotime.Time, granted func(protocol.ByteCount, protocol.Version) ackhandler.StreamFrame, v protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
 	sealer, err := p.cryptoSetup.Get1RTTSealer()
 	if err != nil {
 		return shortHeaderPacket{}, nil, err
@@ -540,10 +542,16 @@ func (p *packetPacker) PackExemptPacket(maxSize protocol.ByteCount, now monotime
 		pl.frames, n = p.framer.AppendExempt(pl.frames, maxPayloadSize-pl.length, v)
 		pl.length += n
 	}
+	if granted != nil && maxPayloadSize-pl.length >= protocol.MinStreamFrameSize {
+		if sf := granted(maxPayloadSize-pl.length, v); sf.Frame != nil {
+			pl.streamFrames = append(pl.streamFrames, sf)
+			pl.length += sf.Frame.Length(v)
+		}
+	}
 	if pl.length == 0 {
 		return shortHeaderPacket{}, nil, errNothingToPack
 	}
-	if len(pl.frames) == 0 {
+	if len(pl.frames) == 0 && len(pl.streamFrames) == 0 {
 		// the packet only contains an ACK
 		if p.numNonAckElicitingAcks >= protocol.MaxNonAckElicitingAcks {
 			ping := &wire.PingFrame{}
@@ -797,6 +805,11 @@ func (p *packetPacker) composeNextPacket(
 				// The DATAGRAM frame doesn't fit, and the packet doesn't contain an ACK.
 				// Discard this frame. There's no point in retrying this in the next packet,
 				// as it's unlikely that the available packet size will increase.
+				//
+				// Without an ACK the whole payload was available, so the frame can
+				// never fit a packet of this size. A builder limit below the packet
+				// size (a permit's Fill allowance) must leave the frame queued
+				// rather than come through here.
 				p.datagramQueue.PopDiscarded()
 				p.peekTimes = 0
 			}

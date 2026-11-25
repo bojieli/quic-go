@@ -240,9 +240,9 @@ func (c *MockPackerPackConnectionCloseCall) DoAndReturn(f func(*qerr.TransportEr
 }
 
 // PackExemptPacket mocks base method.
-func (m *MockPacker) PackExemptPacket(maxPacketSize protocol.ByteCount, now monotime.Time, v protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
+func (m *MockPacker) PackExemptPacket(maxPacketSize protocol.ByteCount, now monotime.Time, granted func(protocol.ByteCount, protocol.Version) ackhandler.StreamFrame, v protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "PackExemptPacket", maxPacketSize, now, v)
+	ret := m.ctrl.Call(m, "PackExemptPacket", maxPacketSize, now, granted, v)
 	ret0, _ := ret[0].(shortHeaderPacket)
 	ret1, _ := ret[1].(*packetBuffer)
 	ret2, _ := ret[2].(error)
@@ -250,9 +250,9 @@ func (m *MockPacker) PackExemptPacket(maxPacketSize protocol.ByteCount, now mono
 }
 
 // PackExemptPacket indicates an expected call of PackExemptPacket.
-func (mr *MockPackerMockRecorder) PackExemptPacket(maxPacketSize, now, v any) *MockPackerPackExemptPacketCall {
+func (mr *MockPackerMockRecorder) PackExemptPacket(maxPacketSize, now, granted, v any) *MockPackerPackExemptPacketCall {
 	mr.mock.ctrl.T.Helper()
-	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PackExemptPacket", reflect.TypeOf((*MockPacker)(nil).PackExemptPacket), maxPacketSize, now, v)
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PackExemptPacket", reflect.TypeOf((*MockPacker)(nil).PackExemptPacket), maxPacketSize, now, granted, v)
 	return &MockPackerPackExemptPacketCall{Call: call}
 }
 
@@ -268,13 +268,13 @@ func (c *MockPackerPackExemptPacketCall) Return(arg0 shortHeaderPacket, arg1 *pa
 }
 
 // Do rewrite *gomock.Call.Do
-func (c *MockPackerPackExemptPacketCall) Do(f func(protocol.ByteCount, monotime.Time, protocol.Version) (shortHeaderPacket, *packetBuffer, error)) *MockPackerPackExemptPacketCall {
+func (c *MockPackerPackExemptPacketCall) Do(f func(protocol.ByteCount, monotime.Time, func(protocol.ByteCount, protocol.Version) ackhandler.StreamFrame, protocol.Version) (shortHeaderPacket, *packetBuffer, error)) *MockPackerPackExemptPacketCall {
 	c.Call = c.Call.Do(f)
 	return c
 }
 
 // DoAndReturn rewrite *gomock.Call.DoAndReturn
-func (c *MockPackerPackExemptPacketCall) DoAndReturn(f func(protocol.ByteCount, monotime.Time, protocol.Version) (shortHeaderPacket, *packetBuffer, error)) *MockPackerPackExemptPacketCall {
+func (c *MockPackerPackExemptPacketCall) DoAndReturn(f func(protocol.ByteCount, monotime.Time, func(protocol.ByteCount, protocol.Version) ackhandler.StreamFrame, protocol.Version) (shortHeaderPacket, *packetBuffer, error)) *MockPackerPackExemptPacketCall {
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }
