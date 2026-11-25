@@ -2778,7 +2778,25 @@ func (c *Conn) maybeSendExemptPacket(now monotime.Time) error {
 	c.logShortHeaderPacket(p, ecn, buf.Len())
 	c.registerPackedShortHeaderPacket(p, ecn, now)
 	c.sendQueue.Send(buf, 0, ecn)
+	// Withdraw what was just served, and come back for what is left (one
+	// PATH_RESPONSE per packet).
+	c.updateDemand()
+	if c.framer.HasExemptData() {
+		c.scheduleSending()
+	}
 	return nil
+}
+
+// exemptPassAfterRefusal is called when admission closes in the middle of a
+// batch. The exempt path runs only when a send pass starts refused, so a
+// PathSender connection with exempt work gets another pass at once.
+func (c *Conn) exemptPassAfterRefusal() {
+	if c.pathSender == nil || !c.sentPacketHandler.AdmissionRefused() {
+		return
+	}
+	if c.grant != nil || c.framer.HasExemptData() {
+		c.scheduleSending()
+	}
 }
 
 // boundGrant is a verification grant bound to a stream.
@@ -2945,9 +2963,11 @@ func (c *Conn) sendPacketsWithoutGSO(now monotime.Time) error {
 		sendMode := c.sentPacketHandler.SendMode(now)
 		if sendMode == ackhandler.SendPacingLimited {
 			c.resetPacingDeadline()
+			c.exemptPassAfterRefusal()
 			return nil
 		}
 		if sendMode != ackhandler.SendAny {
+			c.exemptPassAfterRefusal()
 			return nil
 		}
 		// Prioritize receiving of packets over sending out more packets.
@@ -2990,6 +3010,7 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 			}
 			if sendMode != ackhandler.SendAny {
 				dontSendMore = true
+				c.exemptPassAfterRefusal()
 			}
 		}
 

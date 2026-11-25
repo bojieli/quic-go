@@ -534,7 +534,9 @@ func (s *SendStream) AcceptedOffset() protocol.ByteCount {
 func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCount, v protocol.Version) (ackhandler.StreamFrame, *wire.StreamDataBlockedFrame) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	if s.shutdownErr != nil || s.resetErr != nil {
+	if s.shutdownErr != nil || (s.resetErr != nil && s.reliableOffset() == 0) {
+		// A reliable reset still owes the bytes below its reliable offset;
+		// the pop routines below respect that offset.
 		return ackhandler.StreamFrame{}, nil
 	}
 	// limit is the frame size that carries the range's remaining bytes from
@@ -545,7 +547,8 @@ func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCou
 		return min(maxBytes, header+protocol.ByteCount(quicvarint.Len(uint64(n)))+n)
 	}
 	for i, f := range s.retransmissionQueue {
-		if f.Offset >= end || f.Offset+f.DataLen() <= start {
+		if f.DataLen() == 0 || f.Offset >= end || f.Offset+f.DataLen() <= start {
+			// A FIN-only frame carries no granted byte.
 			continue
 		}
 		if f.Offset < start {

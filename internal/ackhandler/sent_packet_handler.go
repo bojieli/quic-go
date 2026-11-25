@@ -1098,8 +1098,15 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 				// the bytes in flight need to be reduced no matter if the frames in this packet will be retransmitted
 				h.removeFromBytesInFlight(p)
 				h.queueFramesForRetransmission(p)
-				if !p.IsPathMTUProbePacket && ps == nil {
-					cc.OnCongestionEvent(pn, p.Length, priorInFlight)
+				if !p.IsPathMTUProbePacket {
+					if ps == nil {
+						cc.OnCongestionEvent(pn, p.Length, priorInFlight)
+					} else {
+						// The legacy controller counts these; with a
+						// PathSender the transport does.
+						h.connStats.PacketsLost.Add(1)
+						h.connStats.BytesLost.Add(uint64(p.Length))
+					}
 				}
 				h.lostPacketsInfo = append(h.lostPacketsInfo, congestionExt.LostPacketInfo{
 					PacketNumber: congestionExt.PacketNumber(pn),

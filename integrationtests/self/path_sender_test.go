@@ -20,6 +20,8 @@ import (
 // ordinary packet as window-limited. It records what it is told.
 type gatePathSender struct {
 	blocked atomic.Bool
+	// admits, while blocked, is how many more admissions to grant first.
+	admits atomic.Int64
 
 	mu       sync.Mutex
 	attached int
@@ -37,6 +39,9 @@ func (g *gatePathSender) OnAttach(monotime.Time, congestion.ByteCount, congestio
 func (g *gatePathSender) OnDemand(congestion.Demand) {}
 func (g *gatePathSender) Admit(_ monotime.Time, maxBytes congestion.ByteCount) congestion.Permit {
 	if g.blocked.Load() {
+		if g.admits.Add(-1) >= 0 {
+			return congestion.Permit{OK: true, Turn: congestion.ClassBulk, MaxBytes: maxBytes}
+		}
 		return congestion.Permit{}
 	}
 	return congestion.Permit{OK: true, Turn: congestion.ClassBulk, MaxBytes: maxBytes}
@@ -413,4 +418,28 @@ func TestVerificationGrantBudget(t *testing.T) {
 	}
 	g.mu.Unlock()
 	require.LessOrEqual(t, bytes, congestion.ByteCount(1300))
+}
+
+// Admission that closes in the middle of a batch still leaves the grant its
+// build path: the verification bytes do not wait for an unrelated wake-up.
+func TestVerificationGrantAfterAdmissionClosesMidBatch(t *testing.T) {
+	client, server := dialPathSenderPair(t, &quic.Config{})
+	g := &gatePathSender{}
+	installPathSender(t, client, g)
+	g.blocked.Store(true)
+	str, err := client.OpenUniStream()
+	require.NoError(t, err)
+	require.NoError(t, client.BindVerificationGrant(str, congestion.VerificationGrant{
+		ID: 9, Start: 0, End: 8000, Budget: 64 << 10, Expiry: monotime.Now().Add(5 * time.Second),
+	}))
+	g.admits.Store(2) // the first two packets are admitted, then the window closes
+	go func() { _, _ = str.Write(make([]byte, 8000)) }()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	rstr, err := server.AcceptUniStream(ctx)
+	require.NoError(t, err)
+	got, err := readWithin(t, rstr, 8000, time.Second)
+	require.NoError(t, err)
+	require.Len(t, got, 8000)
+	require.Positive(t, g.granted()[9])
 }
