@@ -36,8 +36,8 @@ type framer struct {
 	streamQueue              ringbuffer.RingBuffer[protocol.StreamID]
 	streamsWithControlFrames map[protocol.StreamID]streamControlFrameGetter
 
-	controlFrameMutex          sync.Mutex
-	controlFrames              []wire.Frame
+	controlFrameMutex sync.Mutex
+	controlFrames     []wire.Frame
 	// exemptFrames are obligations that may be sent without a permit, such
 	// as a liveness PING. They are also packed into ordinary packets.
 	exemptFrames               []wire.Frame

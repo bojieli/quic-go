@@ -116,8 +116,8 @@ type sentPacketHandler struct {
 
 	progress  utils.TransportProgress
 	published utils.TransportProgress
-	rttStats        *utils.RTTStats
-	connStats       *utils.ConnectionStats
+	rttStats  *utils.RTTStats
+	connStats *utils.ConnectionStats
 
 	// The number of times a PTO has been sent without receiving an ack.
 	ptoCount uint32
