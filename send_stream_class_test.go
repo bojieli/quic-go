@@ -306,3 +306,22 @@ func TestCancelWriteForgetsTheClassOfCancelledBytes(t *testing.T) {
 	require.Len(t, sfs, 1, "the reliable prefix is filed as CONTROL")
 	require.Equal(t, protocol.ByteCount(100), sfs[0].Frame.DataLen())
 }
+
+// A reliable cancel during a blocked CONTROL write forgets that write's
+// class too: the reliable BULK prefix is served at BULK.
+func TestCancelWriteDuringABlockedWriteForgetsItsClass(t *testing.T) {
+	h := newBuilderHarness(true)
+	str := h.stream(52)
+	str.enableResetStreamAt()
+	writeClassBuffered(t, str, 100, congestion.ClassBulk)
+	str.SetReliableBoundary() // at 100
+	done := make(chan error, 1)
+	go func() {
+		_, err := str.WriteClass(make([]byte, 4000), congestion.ClassControl) // blocks: larger than the buffer
+		done <- err
+	}()
+	require.Eventually(t, func() bool { return str.streamClass() == congestion.ClassControl }, time.Second, time.Millisecond)
+	str.CancelWrite(1)
+	require.Equal(t, congestion.ClassBulk, str.streamClass())
+	require.Error(t, <-done)
+}

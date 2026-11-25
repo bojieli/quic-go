@@ -141,6 +141,17 @@ func (f *framer) fileStream(id protocol.StreamID, str streamFrameGetter) {
 	f.file(id, class)
 }
 
+// SetBoundSmallScans says whether the packet being built already carries
+// work, so a small class budget may be offered to only a few streams.
+func (f *framer) SetBoundSmallScans(on bool) {
+	f.mutex.Lock()
+	f.boundSmallScans = on
+	f.mutex.Unlock()
+}
+
+// connWindowOpen says whether the connection's send window is open.
+func (f *framer) connWindowOpen() bool { return f.connFlowController.SendWindowSize() > 0 }
+
 // HasSendableClassedData says whether the framer has work a packet could
 // carry now: control or exempt frames, or a stream that could send. Unlike
 // HasData it does not count a stream that is filed but has nothing to send,
@@ -387,10 +398,12 @@ func (f *framer) appendClassStreams(
 	f.serving = true
 	defer func() { f.serving = false }()
 	tries := ring.Len()
-	if maxLen < smallClassBudget {
-		// A budget this small may fit no stream's frame. Offer it to a few
-		// streams, in turn, rather than walk the whole ring every packet;
-		// the round-robin order still moves on.
+	if maxLen < smallClassBudget && f.boundSmallScans {
+		// A budget this small may fit no stream's frame. When the packet
+		// already carries work, offer it to a few streams, in turn, rather
+		// than walk the whole ring every packet; the round-robin order
+		// still moves on. A packet with nothing in it yet is never declared
+		// empty on a partial scan.
 		tries = min(tries, smallBudgetTries)
 	}
 	for range tries {

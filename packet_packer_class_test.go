@@ -659,9 +659,27 @@ func TestClassedFramerBoundsTheScanForATinyBudget(t *testing.T) {
 		s := &countingClassedStream{fakeClassedStream: fakeClassedStream{id: protocol.StreamID(4 * (i + 1)), class: congestion.ClassBulk}, pops: &pops}
 		h.framer.AddActiveStream(s.id, s)
 	}
+	h.framer.SetBoundSmallScans(true) // the packet already carries work
 	h.framer.AppendClass(nil, nil, congestion.ClassBulk, 8, false, monotime.Now(), protocol.Version1)
 	require.LessOrEqual(t, pops, smallBudgetTries)
 	pops = 0
+	h.framer.SetBoundSmallScans(false) // an empty packet is never declared empty on a partial scan
+	h.framer.AppendClass(nil, nil, congestion.ClassBulk, 8, false, monotime.Now(), protocol.Version1)
+	require.Equal(t, 100, pops, "an otherwise empty packet offers the budget to every stream")
+	pops = 0
+	h.framer.SetBoundSmallScans(true)
 	h.framer.AppendClass(nil, nil, congestion.ClassBulk, 1200, false, monotime.Now(), protocol.Version1)
 	require.Equal(t, 100, pops, "a normal budget still offers every stream its turn")
+}
+
+// An ACK that is not yet due is not taken for work the permit does not let
+// into the packet: BULK data queued under a CONTROL turn with no BULK fill.
+func TestClassedBuilderTakesNoEarlyAckForWorkThePermitExcludes(t *testing.T) {
+	h := newBuilderHarness(true)
+	acks := &recordingAcks{}
+	h.packer.acks = acks
+	writeClassBuffered(t, h.stream(4), 100, congestion.ClassBulk)
+	h.packer.composeClassedPacket(testPayload, testPayload, congestion.Permit{OK: true, Turn: congestion.ClassControl, MaxBytes: 1252}, true, monotime.Now(), protocol.Version1)
+	h.packer.composeClassedPacket(testPayload, testPayload, congestion.Permit{OK: true, Turn: congestion.ClassBulk, MaxBytes: 1252}, true, monotime.Now(), protocol.Version1)
+	require.Equal(t, []bool{true, false}, acks.onlyIfQueued, "only a permit that lets the BULK data in may take an ACK early")
 }

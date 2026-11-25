@@ -47,6 +47,9 @@ type framer struct {
 	ringOf     map[protocol.StreamID]ringEntry
 	liveIn     [congestion.NumSendClasses]int
 	serving    bool // a ring is being served; no compaction meanwhile
+	// boundSmallScans is set while the packet being built already carries
+	// work; see appendClassStreams.
+	boundSmallScans bool
 	// heldStreamControl are streams' control frames taken by a CONTROL pass
 	// whose allowance they did not fit; they go first in a later one.
 	heldStreamControl []ackhandler.Frame

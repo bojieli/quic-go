@@ -74,17 +74,15 @@ func (p *packetPacker) maybeGetClassedPacket(maxPayloadSize, fullPayload protoco
 
 func (p *packetPacker) composeClassedPacket(maxPayloadSize, fullPayload protocol.ByteCount, permit congestion.Permit, ackAllowed bool, now monotime.Time, v protocol.Version) payload {
 	cf := p.framer.(classedFrameSource)
-	// Whether anything could ride with an ACK that is not yet due: sendable
-	// work, not ring membership.
 	hasData := p.framer.HasData()
-	if s, ok := p.framer.(interface{ HasSendableClassedData() bool }); ok {
-		hasData = s.HasSendableClassedData()
-	}
 	hasRetransmission := p.retransmissionQueue.HasData(protocol.Encryption1RTT)
 
 	var pl payload
 	if ackAllowed {
-		if ack := p.acks.GetAckFrame(protocol.Encryption1RTT, now, !hasRetransmission && !hasData); ack != nil {
+		// An ACK that is not yet due is taken only if work this permit
+		// allows can ride with it.
+		early := p.permitHasWork(permit, hasRetransmission)
+		if ack := p.acks.GetAckFrame(protocol.Encryption1RTT, now, !early); ack != nil {
 			ack.Truncate(maxPayloadSize, v)
 			pl.ack = ack
 			pl.length += ack.Length(v)
@@ -139,6 +137,9 @@ func (p *packetPacker) composeClassedPacket(maxPayloadSize, fullPayload protocol
 			// A class that has the rest of the packet may count on being
 			// last and use the bytes of the final length field.
 			last := limit >= remaining
+			if b, ok := p.framer.(interface{ SetBoundSmallScans(bool) }); ok {
+				b.SetBoundSmallScans(len(pl.frames) > startLen || len(pl.streamFrames) > 0 || used > 0)
+			}
 			var n protocol.ByteCount
 			pl.frames, pl.streamFrames, n = cf.AppendClass(pl.frames, pl.streamFrames, class, limit-used, last, now, v)
 			used += n
@@ -163,6 +164,36 @@ func (p *packetPacker) composeClassedPacket(maxPayloadSize, fullPayload protocol
 		}
 	}
 	return pl
+}
+
+// permitHasWork says whether there is work a permit allows into a packet:
+// an exempt obligation, or work of its turn or of a class it lists in Fill.
+func (p *packetPacker) permitHasWork(permit congestion.Permit, hasRetransmission bool) bool {
+	if p.framer.HasExemptData() {
+		return true
+	}
+	allowed := func(c congestion.SendClass) bool { return c == permit.Turn || permit.Fill[c] > 0 }
+	f, ok := p.framer.(interface {
+		HasControlData() bool
+		StreamDemand(bool) [congestion.NumSendClasses]bool
+		connWindowOpen() bool
+	})
+	if !ok {
+		return p.framer.HasData() || hasRetransmission
+	}
+	if allowed(congestion.ClassControl) && (hasRetransmission || f.HasControlData()) {
+		return true
+	}
+	if allowed(congestion.ClassInteractive) && p.datagramQueue != nil && p.datagramQueue.Peek() != nil {
+		return true
+	}
+	streams := f.StreamDemand(f.connWindowOpen())
+	for _, c := range classOrder {
+		if allowed(c) && streams[c] {
+			return true
+		}
+	}
+	return false
 }
 
 // appendClassedDatagram adds the queued DATAGRAM frame if it fits within
