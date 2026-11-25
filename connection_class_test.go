@@ -252,7 +252,9 @@ type exactGrantScheduler struct {
 	demandRecorder
 	limit   congestion.ByteCount
 	retryAt monotime.Time // when set, a request over limit is a pacing refusal
-	asked   []congestion.ByteCount
+	// closed refuses requests within limit too, as a window refusal.
+	closed bool
+	asked  []congestion.ByteCount
 }
 
 func (s *exactGrantScheduler) SchedulesClasses() bool { return true }
@@ -260,6 +262,9 @@ func (s *exactGrantScheduler) Admit(_ monotime.Time, maxBytes congestion.ByteCou
 	s.asked = append(s.asked, maxBytes)
 	if s.limit > 0 && maxBytes > s.limit {
 		return congestion.Permit{RetryAt: s.retryAt} // a window refusal, or a pacing one with retryAt
+	}
+	if s.closed {
+		return congestion.Permit{}
 	}
 	return congestion.Permit{OK: true, Turn: congestion.ClassBulk, MaxBytes: maxBytes}
 }
@@ -334,4 +339,35 @@ func TestRefusedMTUProbeFallsBackToOrdinaryAdmission(t *testing.T) {
 			require.Equal(t, deadlineSendImmediately, conn.pacingDeadline, "an earlier wake is kept")
 		}
 	}
+}
+
+// A probe the scheduler paces, on a connection whose ordinary admission is
+// window-limited, still wakes the connection when the probe may go: the
+// armed timer fires at the probe's retry time.
+func TestRefusedMTUProbeRetryArmsTheTimer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ps := &exactGrantScheduler{limit: 1200, closed: true}
+		conn, mtu, _ := newMTUProbeConn(t, ps)
+		now := monotime.Now()
+		ps.retryAt = now.Add(10 * time.Millisecond)
+		conn.config = populateConfig(&Config{})
+		conn.rttStats = utils.NewRTTStats()
+		conn.handshakeComplete = true
+		conn.idleTimeout = time.Hour
+		conn.lastPacketReceivedTime = now
+		conn.timer = time.NewTimer(time.Hour)
+		mode, retry := conn.admitFirstPacket(now)
+		require.Equal(t, ackhandler.SendAck, mode, "the ordinary admission is window-limited")
+		require.Equal(t, ps.retryAt, retry)
+		conn.blocked = blockModeCongestionLimited // as triggerSending sets it
+		conn.armMTUProbeRetry(now, retry)
+		require.True(t, mtu.ShouldSendProbe(now))
+		conn.maybeResetTimer()
+		time.Sleep(10*time.Millisecond + time.Nanosecond)
+		select {
+		case <-conn.timer.C:
+		default:
+			t.Fatal("no timer armed for the probe's retry")
+		}
+	})
 }

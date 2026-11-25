@@ -3078,13 +3078,19 @@ func (c *Conn) admitFirstPacket(now monotime.Time) (_ ackhandler.SendMode, probe
 
 // armMTUProbeRetry makes sure the connection wakes when a refused MTU probe
 // may be admitted, if the probe is still due when the send pass ends: the
-// ordinary admission that followed the refusal replaced its retry time.
+// ordinary admission that followed the refusal replaced its retry time. A
+// window refusal of the ordinary packet leaves the connection congestion
+// limited, which arms no pacing timer; with a PathSender that mode decides
+// nothing else, so it is lifted for the probe's retry.
 func (c *Conn) armMTUProbeRetry(now, at monotime.Time) {
 	if !c.mtuDiscoverer.ShouldSendProbe(now) {
 		return
 	}
 	if c.pacingDeadline.IsZero() || at.Before(c.pacingDeadline) {
 		c.pacingDeadline = at
+	}
+	if c.blocked == blockModeCongestionLimited {
+		c.blocked = blockModeNone
 	}
 }
 
