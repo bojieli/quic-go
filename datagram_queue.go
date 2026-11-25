@@ -51,12 +51,13 @@ func newDatagramQueue(hasData func(), logger utils.Logger) *datagramQueue {
 // Once that limit is reached, Add blocks until the queue size has reduced.
 func (h *datagramQueue) Add(f *wire.DatagramFrame) error {
 	h.sendMx.Lock()
-	if f.Tagged && h.drained {
-		h.sendMx.Unlock()
-		return h.closeErr
-	}
 
 	for {
+		if f.Tagged && h.drained {
+			// Nothing would report the outcome.
+			h.sendMx.Unlock()
+			return h.closeErr
+		}
 		if h.sendQueue.Len() < maxDatagramSendQueueLen {
 			h.sendQueue.PushBack(f)
 			h.sendMx.Unlock()

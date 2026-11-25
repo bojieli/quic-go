@@ -788,11 +788,13 @@ runLoop:
 		}
 	}
 
+	c.pathSenderMx.Lock()
 	if c.pathSender != nil {
 		c.sentPacketHandler.DetachPathSender(monotime.Now())
 		c.pathSender = nil
 		c.hasPathSender.Store(false)
 	}
+	c.pathSenderMx.Unlock()
 	closeErr := c.closeErr.Load()
 	c.cryptoStreamHandler.Close()
 	c.sendQueue.Close() // close the send queue before sending the CONNECTION_CLOSE
@@ -985,11 +987,13 @@ func (c *Conn) applyPendingSettings(now monotime.Time) {
 	if !c.hasPendingInstall.Load() {
 		return
 	}
+	// The installation completes under the mutex, so a concurrent
+	// SetCongestionControl either queues behind it or sees its result.
 	c.pathSenderMx.Lock()
+	defer c.pathSenderMx.Unlock()
 	cc := c.pendingController
 	c.pendingController = nil
 	c.hasPendingInstall.Store(false)
-	c.pathSenderMx.Unlock()
 	if cc == nil {
 		return
 	}
@@ -3496,8 +3500,8 @@ func (c *Conn) SetCongestionControl(cc congestion.CongestionControl) {
 		c.scheduleSending()
 		return
 	}
-	c.pathSenderMx.Unlock()
 	c.sentPacketHandler.SetCongestionControl(cc)
+	c.pathSenderMx.Unlock()
 }
 
 // InitialPacketSize returns the datagram size the connection starts out with,

@@ -118,6 +118,11 @@ type Demand struct{ Eligible [NumSendClasses]bool }
 
 // Permit is the answer to Admit. A permit reserves nothing: it is a value
 // owned by one build operation, and all state changes at OnSent.
+//
+// The packet builder does not yet honour Turn, Fill or MaxBytes: it fills a
+// permitted packet as it would any other, up to the connection's packet size.
+// A PathSender must therefore admit whole packets of any class. Building
+// under the permit's class and limits is a later change.
 type Permit struct {
 	OK   bool
 	Turn SendClass

@@ -1,8 +1,10 @@
 package ackhandler
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -113,10 +115,13 @@ type sentPacketHandler struct {
 	livenessPending bool
 	// discardRefs is scratch space for OnDiscarded.
 	discardRefs []congestionExt.PacketRef
-	// reportedLost holds the application packets reported lost to the
-	// PathSender, with their size, so that a later acknowledgement can be
-	// reported as a correction of exactly the reference that was reported.
-	reportedLost map[protocol.PacketNumber]protocol.ByteCount
+	// lateAcks holds the ack-eliciting application packets declared lost,
+	// for the horizon of the lost-packet tracker. A later acknowledgement of
+	// one is transport progress and, if it was reported lost to the installed
+	// PathSender, a correction of exactly that reference.
+	lateAcks map[protocol.PacketNumber]lostRecord
+	// controllerGen identifies the installed PathSender.
+	controllerGen uint32
 	// appInFlight is the application-data part of bytesInFlight.
 	appInFlight protocol.ByteCount
 
@@ -155,6 +160,13 @@ type sentPacketHandler struct {
 }
 
 var _ SentPacketHandler = &sentPacketHandler{}
+
+type lostRecord struct {
+	size     protocol.ByteCount
+	sent     monotime.Time
+	reported bool   // to a PathSender
+	gen      uint32 // the PathSender it was reported to
+}
 
 // clientAddressValidated indicates whether the address was validated beforehand by an address validation token.
 // If the address was validated, the amplification limit doesn't apply. It has no effect for a client.
@@ -351,10 +363,13 @@ func (h *sentPacketHandler) SentPacket(
 	cc, ps := h.getControllers()
 	// A permit covers exactly one packet. It is only used, and only touched,
 	// on the run loop while a PathSender is installed.
+	// In a coalesced datagram the permit belongs to the application packet.
 	var underPermit bool
 	if ps != nil {
 		underPermit = h.permit.OK
-		h.permit = congestionExt.Permit{}
+		if encLevel == protocol.Encryption1RTT || encLevel == protocol.Encryption0RTT {
+			h.permit = congestionExt.Permit{}
+		}
 	}
 
 	if isPathProbePacket {
@@ -491,9 +506,10 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	if len(ackedPackets) == 0 {
 		// An ACK that covers only packets already declared lost still
 		// corrects them, as long as the lost-packet tracker holds them.
-		if ps != nil && encLevel == protocol.Encryption1RTT {
-			if spurious := h.detectSpuriousLosses(ack, rcvTime, rcvTime.Add(-min(ack.DelayTime, h.rttStats.MaxAckDelay()))); len(spurious) > 0 {
-				h.publishProgress()
+		if encLevel == protocol.Encryption1RTT {
+			spurious := h.creditLateAcks(ack, rcvTime, ps)
+			h.publishProgress()
+			if ps != nil && len(spurious) > 0 {
 				ps.OnAckEvent(congestionExt.AckEvent{
 					Time:     rcvTime,
 					InFlight: congestionExt.ByteCount(h.bytesInFlight),
@@ -583,19 +599,19 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		}
 	}
 
+	// A late acknowledgement of a packet declared lost, from a reordered ACK
+	// too, is progress and corrects the loss.
+	if encLevel == protocol.Encryption1RTT {
+		event.Spurious = h.creditLateAcks(ack, rcvTime, ps)
+	}
 	// detect spurious losses for application data packets, if the ACK was not reordered
 	if encLevel == protocol.Encryption1RTT && largestAcked == pnSpace.largestAcked {
-		event.Spurious = h.detectSpuriousLosses(
+		h.detectSpuriousLosses(
 			ack,
-			rcvTime,
 			rcvTime.Add(-min(ack.DelayTime, h.rttStats.MaxAckDelay())),
 		)
 		// clean up lost packet history
 		h.lostPackets.DeleteBefore(rcvTime.Add(-3 * h.rttStats.PTO(false)))
-		h.pruneReportedLost()
-	} else if ps != nil && encLevel == protocol.Encryption1RTT {
-		// A reordered ACK can still correct a loss.
-		event.Spurious = h.detectSpuriousLosses(ack, rcvTime, rcvTime.Add(-min(ack.DelayTime, h.rttStats.MaxAckDelay())))
 	}
 	if ps != nil {
 		event.Time = rcvTime
@@ -629,10 +645,7 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	return acked1RTTPacket, nil
 }
 
-// detectSpuriousLosses returns, for a PathSender only, the corrections of
-// packets that were reported lost to it. Each is an ack-eliciting application
-// packet newly acknowledged, so it is also transport progress.
-func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, rcvTime, ackTime monotime.Time) []congestionExt.PacketRef {
+func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime monotime.Time) {
 	var maxPacketReordering protocol.PacketNumber
 	var maxTimeReordering time.Duration
 	ackRangeIdx := len(ack.AckRanges) - 1
@@ -667,35 +680,36 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, rcvTime, ac
 			spuriousLosses = append(spuriousLosses, pn)
 		}
 	}
-	var refs []congestionExt.PacketRef
 	for _, pn := range spuriousLosses {
 		h.lostPackets.Delete(pn)
-		if size, ok := h.reportedLost[pn]; ok {
-			delete(h.reportedLost, pn)
-			refs = append(refs, congestionExt.PacketRef{Space: congestionExt.SpaceApplication, Number: congestionExt.PacketNumber(pn), Bytes: congestionExt.ByteCount(size)})
+	}
+}
+
+// creditLateAcks finds the ack-eliciting application packets declared lost
+// that this ACK acknowledges. Each is transport progress. It returns those
+// reported lost to the installed PathSender, as the references that were
+// reported, and forgets records past the lost-packet tracker's horizon.
+func (h *sentPacketHandler) creditLateAcks(ack *wire.AckFrame, rcvTime monotime.Time, ps congestionExt.PathSender) []congestionExt.PacketRef {
+	if len(h.lateAcks) == 0 {
+		return nil
+	}
+	horizon := rcvTime.Add(-3 * h.rttStats.PTO(false))
+	var refs []congestionExt.PacketRef
+	for pn, r := range h.lateAcks {
+		if ack.AcksPacket(pn) {
+			delete(h.lateAcks, pn)
 			h.progress.Epoch++
 			h.progress.Last = rcvTime
 			h.progress.PTOExpiries = 0
+			if ps != nil && r.reported && r.gen == h.controllerGen {
+				refs = append(refs, congestionExt.PacketRef{Space: congestionExt.SpaceApplication, Number: congestionExt.PacketNumber(pn), Bytes: congestionExt.ByteCount(r.size)})
+			}
+		} else if r.sent.Before(horizon) {
+			delete(h.lateAcks, pn)
 		}
 	}
+	slices.SortFunc(refs, func(a, b congestionExt.PacketRef) int { return cmp.Compare(a.Number, b.Number) })
 	return refs
-}
-
-// pruneReportedLost forgets reported losses the lost-packet tracker no longer
-// holds: they can no longer be corrected.
-func (h *sentPacketHandler) pruneReportedLost() {
-	if len(h.reportedLost) <= 2*64 {
-		return
-	}
-	held := make(map[protocol.PacketNumber]struct{}, 64)
-	for pn := range h.lostPackets.All() {
-		held[pn] = struct{}{}
-	}
-	for pn := range h.reportedLost {
-		if _, ok := held[pn]; !ok {
-			delete(h.reportedLost, pn)
-		}
-	}
 }
 
 // Packets are returned in ascending packet number order.
@@ -1040,11 +1054,11 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 					PacketNumber: congestionExt.PacketNumber(pn),
 					BytesLost:    congestionExt.ByteCount(p.Length),
 				})
-				if ps != nil && (encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT) {
-					if h.reportedLost == nil {
-						h.reportedLost = make(map[protocol.PacketNumber]protocol.ByteCount)
+				if encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT {
+					if h.lateAcks == nil {
+						h.lateAcks = make(map[protocol.PacketNumber]lostRecord)
 					}
-					h.reportedLost[pn] = p.Length
+					h.lateAcks[pn] = lostRecord{size: p.Length, sent: p.SendTime, reported: ps != nil, gen: h.controllerGen}
 				}
 				if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
 					h.ecnTracker.LostPacket(pn)
@@ -1389,6 +1403,7 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 	}
 	h.initialPackets = newPacketNumberSpace(h.initialPackets.pns.Peek(), false)
 	h.appDataPackets = newPacketNumberSpace(h.appDataPackets.pns.Peek(), true)
+	h.publishProgress()
 	oldAlarm := h.alarm
 	h.alarm = alarmTimer{}
 	if h.qlogger != nil {
@@ -1486,6 +1501,7 @@ func (h *sentPacketHandler) SetCongestionControl(cc congestionExt.CongestionCont
 	if old != nil {
 		// Replacing a PathSender happens on the run loop.
 		h.permit = congestionExt.Permit{}
+		h.controllerGen++
 		old.OnDetach(monotime.Now())
 	}
 }
@@ -1506,6 +1522,7 @@ func (h *sentPacketHandler) InstallPathSender(ps congestionExt.PathSender, now m
 	h.congestion = &ccAdapter{ps}
 	h.pathSender = ps
 	h.permit = congestionExt.Permit{}
+	h.controllerGen++
 	h.congestionMutex.Unlock()
 }
 

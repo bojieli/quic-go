@@ -372,3 +372,41 @@ func TestMigrationWithoutPathSenderReplacesTheController(t *testing.T) {
 	_, isAdapter := sph.getCongestionControl().(*ccAdapter)
 	require.False(t, isAdapter)
 }
+
+// A late acknowledgement of a packet declared lost is transport progress for
+// every connection, and a correction only for the PathSender it was reported
+// to.
+func TestLateAcknowledgementIsProgressAndScopedCorrection(t *testing.T) {
+	for _, withPathSender := range []bool{false, true} {
+		sph := NewSentPacketHandler(0, 1200, utils.NewRTTStats(), &utils.ConnectionStats{}, true, false, nil, protocol.PerspectiveClient, false, nil, utils.DefaultLogger).(*sentPacketHandler)
+		ps := newRecordingPathSender()
+		if withPathSender {
+			sph.InstallPathSender(ps, monotime.Now(), func() {})
+		}
+		var tr packetTracker
+		start := monotime.Now()
+		var pns []protocol.PacketNumber
+		for i := range 5 {
+			pns = append(pns, sendPing(sph, &tr, start.Add(time.Duration(i)*time.Millisecond), protocol.Encryption1RTT, 1000))
+		}
+		now := start.Add(50 * time.Millisecond)
+		_, err := sph.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(pns[4])}, protocol.Encryption1RTT, now)
+		require.NoError(t, err)
+		require.Equal(t, uint64(1), sph.connStats.Progress().Epoch)
+		if withPathSender {
+			require.Len(t, ps.lastAck().Lost, 2)
+			// Replace and reinstall: the new controller was never told of
+			// the loss, so it gets no correction for it.
+			sph.SetCongestionControl(newRecordingPathSender())
+			ps = newRecordingPathSender()
+			sph.InstallPathSender(ps, now, func() {})
+		}
+		// A reordered ACK covering the lost packet.
+		_, err = sph.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(pns[0], pns[4])}, protocol.Encryption1RTT, now.Add(time.Millisecond))
+		require.NoError(t, err)
+		require.Equal(t, uint64(2), sph.connStats.Progress().Epoch, "with a PathSender: %v", withPathSender)
+		if withPathSender {
+			require.Empty(t, ps.acks)
+		}
+	}
+}
