@@ -3058,16 +3058,25 @@ func (c *Conn) setClassed(on bool) {
 // the probe's size, which is larger than an ordinary packet: a scheduler that
 // grants what it is asked would otherwise never issue a permit the probe
 // fits. The probe is not taken from the discoverer, so not in flight, until a
-// permit covers it. A scheduler may refuse the probe's size and still admit
-// an ordinary packet, so a refusal is followed by an ordinary admission, and
-// the probe stays due. probeRetry is when the scheduler said the probe's
+// permit covers it. A scheduler may refuse the probe's size, or grant less
+// than it, and still admit an ordinary packet in full, so a refusal or a
+// permit that does not cover the probe is followed by an ordinary admission,
+// and the probe stays due. probeRetry is when the scheduler said the probe's
 // refusal may clear, or zero.
 func (c *Conn) admitFirstPacket(now monotime.Time) (_ ackhandler.SendMode, probeRetry monotime.Time) {
 	if !c.requestMTUProbeAdmission(now) {
 		return c.sentPacketHandler.SendMode(now), 0
 	}
 	mode := c.sentPacketHandler.SendMode(now)
-	if mode == ackhandler.SendAny || !c.sentPacketHandler.AdmissionRefused() {
+	if mode == ackhandler.SendAny {
+		if c.permitCoversMTUProbe() {
+			return mode, 0
+		}
+		// A permit too short for the probe is asked for again at the
+		// ordinary size, which the scheduler may grant in full.
+		return c.sentPacketHandler.SendMode(now), 0
+	}
+	if !c.sentPacketHandler.AdmissionRefused() {
 		return mode, 0
 	}
 	if mode == ackhandler.SendPacingLimited {

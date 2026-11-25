@@ -254,12 +254,17 @@ type exactGrantScheduler struct {
 	retryAt monotime.Time // when set, a request over limit is a pacing refusal
 	// closed refuses requests within limit too, as a window refusal.
 	closed bool
+	// short grants a request over limit only this many bytes.
+	short congestion.ByteCount
 	asked  []congestion.ByteCount
 }
 
 func (s *exactGrantScheduler) SchedulesClasses() bool { return true }
 func (s *exactGrantScheduler) Admit(_ monotime.Time, maxBytes congestion.ByteCount) congestion.Permit {
 	s.asked = append(s.asked, maxBytes)
+	if s.limit > 0 && maxBytes > s.limit && s.short > 0 {
+		return congestion.Permit{OK: true, Turn: congestion.ClassBulk, MaxBytes: s.short}
+	}
 	if s.limit > 0 && maxBytes > s.limit {
 		return congestion.Permit{RetryAt: s.retryAt} // a window refusal, or a pacing one with retryAt
 	}
@@ -370,4 +375,20 @@ func TestRefusedMTUProbeRetryArmsTheTimer(t *testing.T) {
 			t.Fatal("no timer armed for the probe's retry")
 		}
 	})
+}
+
+// A permit granted for the probe's size but too short to carry the probe is
+// followed by an ordinary admission, which the scheduler may grant in full:
+// work that fits an ordinary packet is not held behind the probe.
+func TestShortMTUProbePermitFallsBackToOrdinaryAdmission(t *testing.T) {
+	ps := &exactGrantScheduler{limit: 1200, short: 128}
+	conn, mtu, _ := newMTUProbeConn(t, ps)
+	now := monotime.Now()
+	mode, retry := conn.admitFirstPacket(now)
+	require.Equal(t, ackhandler.SendAny, mode)
+	require.Zero(t, retry)
+	require.Equal(t, []congestion.ByteCount{congestion.ByteCount(mtu.NextProbeSize()), 1200}, ps.asked)
+	permit, _ := conn.currentClassPermit()
+	require.Equal(t, congestion.ByteCount(1200), permit.MaxBytes, "the ordinary permit is the one built under")
+	require.True(t, mtu.ShouldSendProbe(now), "the probe stays due")
 }
