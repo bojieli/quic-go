@@ -150,8 +150,9 @@ func (c *classPathSender) ordinaryClassBytes() [congestion.NumSendClasses]conges
 	defer c.mu.Unlock()
 	var sum [congestion.NumSendClasses]congestion.ByteCount
 	for _, p := range c.sent {
-		if p.Exempt || p.Kind != congestion.KindOrdinary {
-			// MTU probes are INTERACTIVE whatever the turn.
+		if p.Exempt || p.Kind != congestion.KindOrdinary || !p.ClassBuilt {
+			// MTU probes are INTERACTIVE whatever the turn, and before the
+			// client's handshake is confirmed permits only admit.
 			continue
 		}
 		for i, b := range p.ClassBytes {
@@ -176,6 +177,19 @@ func TestClassScheduledPacketsCarryOnlyTheirTurn(t *testing.T) {
 		defer c.mu.Unlock()
 		return c.attached == 1
 	}, time.Second, time.Millisecond)
+
+	// Permits are executed from handshake confirmation on: wait for the
+	// first packet built under one.
+	require.Eventually(t, func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		for _, p := range c.sent {
+			if p.ClassBuilt {
+				return true
+			}
+		}
+		return false
+	}, 2*time.Second, time.Millisecond)
 
 	bulk, err := client.OpenUniStream()
 	require.NoError(t, err)
