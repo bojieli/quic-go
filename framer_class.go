@@ -135,11 +135,13 @@ func (f *framer) fileStream(id protocol.StreamID, str streamFrameGetter) {
 	f.file(id, class)
 }
 
-// hasClassedStreams says whether any class ring holds a stream. It must be
+// hasClassedStreams says whether any class ring holds a live stream. It must be
 // called with the mutex held.
 func (f *framer) hasClassedStreams() bool {
-	for i := range f.classRings {
-		if !f.classRings[i].Empty() {
+	// Live entries only: a stale entry left in a ring that gets no turn is
+	// not data, and must not make the builder send an ACK early.
+	for _, n := range f.liveIn {
+		if n > 0 {
 			return true
 		}
 	}

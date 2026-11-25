@@ -469,3 +469,15 @@ func TestClassedControlPassKeepsTheBacklogInOrder(t *testing.T) {
 		require.Equal(t, protocol.StreamNum(50-i), n, "popped from the end, as the ordinary builder does")
 	}
 }
+
+// A stale ring entry is not data: once a re-filed stream has drained, the
+// framer reports nothing to send, so no ACK is sent before it is due.
+func TestClassedFramerIgnoresStaleEntriesForHasData(t *testing.T) {
+	h := newBuilderHarness(true)
+	str := h.stream(4)
+	writeClassBuffered(t, str, 100, congestion.ClassBulk)
+	str.SetBoost(true) // re-filed in CONTROL; a BULK entry is left behind
+	_, sfs, _ := h.framer.AppendClass(nil, nil, congestion.ClassControl, 1200, true, monotime.Now(), protocol.Version1)
+	require.Len(t, sfs, 1)
+	require.False(t, h.framer.HasData())
+}
