@@ -1349,6 +1349,11 @@ func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
 // controller.
 func (h *sentPacketHandler) pathSenderSendMode(ps congestionExt.PathSender, now monotime.Time, numTrackedPackets int) SendMode {
 	h.permit = ps.Admit(now, congestionExt.ByteCount(h.maxDatagramSize))
+	if h.classed && h.permit.OK && h.permit.MaxBytes < congestionExt.MinClassedPermit {
+		// Too small to build a packet in: a window refusal, so the exempt
+		// obligations, due ACKs among them, still go.
+		h.permit = congestionExt.Permit{}
+	}
 	// The transport's outstanding-packet limit comes first: whatever the
 	// controller answered, only an ACK may go, and no exempt obligation or
 	// grant may spend the headroom kept for ACKs.

@@ -94,3 +94,12 @@ func (r *RingBuffer[T]) Clear() {
 	}
 	r.headPos, r.tailPos, r.full = 0, 0, false
 }
+
+// At returns the i-th element from the front without removing it. It must
+// be called with 0 <= i < Len().
+func (r *RingBuffer[T]) At(i int) T {
+	if i < 0 || i >= r.Len() {
+		panic("github.com/apernet/quic-go/internal/utils/ringbuffer: index out of range")
+	}
+	return r.ring[(r.headPos+i)%len(r.ring)]
+}

@@ -158,10 +158,19 @@ type Permit struct {
 // with the packet overhead charged to the turn. A datagram that does not fit
 // a class's allowance stays queued. PTO probes and MTU probes are built
 // without regard to the turn; an MTU probe's bytes are INTERACTIVE.
+//
+// A permit's MaxBytes must be at least MinClassedPermit. A smaller permit
+// is treated as a window refusal: the connection sends only its exempt
+// obligations, due ACKs among them, until a usable permit comes.
 type ClassScheduler interface {
 	PathSender
 	SchedulesClasses() bool
 }
+
+// MinClassedPermit is the smallest packet a class-scheduled permit may
+// allow: room for the header, the AEAD tag, a truncated ACK frame and some
+// class work, whatever the connection ID and packet number lengths.
+const MinClassedPermit ByteCount = 128
 
 // SentPacket describes a packet as it was actually built and registered.
 type SentPacket struct {

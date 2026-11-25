@@ -506,3 +506,16 @@ func TestClassedPacketBytesAreReportedByServedClass(t *testing.T) {
 		}
 	}
 }
+
+// A class-scheduled permit below MinClassedPermit is a window refusal, so the
+// exempt path, due ACKs included, still runs.
+func TestClassedPermitBelowTheMinimumIsARefusal(t *testing.T) {
+	rec := newRecordingPathSender()
+	sph := NewSentPacketHandler(0, 1200, utils.NewRTTStats(), &utils.ConnectionStats{}, true, false, nil, protocol.PerspectiveClient, false, nil, utils.DefaultLogger).(*sentPacketHandler)
+	sph.InstallPathSender(classedRecordingPathSender{rec}, monotime.Now(), func() {})
+	rec.admit = congestion.Permit{OK: true, Turn: congestion.ClassBulk, MaxBytes: congestion.MinClassedPermit - 1}
+	require.Equal(t, SendAck, sph.SendMode(monotime.Now()))
+	require.True(t, sph.AdmissionRefused())
+	rec.admit.MaxBytes = congestion.MinClassedPermit
+	require.Equal(t, SendAny, sph.SendMode(monotime.Now()))
+}

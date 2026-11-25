@@ -2783,6 +2783,10 @@ func (c *Conn) maybeSendExemptPacket(now monotime.Time) error {
 				c.framer.QueueControlFrame(blocked)
 			}
 			if sf.Frame != nil {
+				// The stream's class may have moved on with the bytes taken.
+				c.framer.RefileStream(g.str.streamID, g.str)
+			}
+			if sf.Frame != nil {
 				usedGrant = g
 				// Charge the packet as it stands, so the budget is spent
 				// before the lock is released; corrected to its final

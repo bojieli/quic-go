@@ -157,11 +157,9 @@ func (f *framer) StreamDemand(connWindow bool) [congestion.NumSendClasses]bool {
 	defer f.mutex.Unlock()
 	for _, class := range classOrder {
 		ring := &f.classRings[class]
-		for range ring.Len() {
-			// A full rotation leaves the ring's order as it was.
-			e := ring.PopFront()
-			ring.PushBack(e)
-			if d[class] || !f.live(e) {
+		for i := 0; i < ring.Len() && !d[class]; i++ {
+			e := ring.At(i)
+			if !f.live(e) {
 				continue
 			}
 			str := f.activeStreams[e.id]
@@ -210,12 +208,6 @@ func (f *framer) AppendClass(
 	var n protocol.ByteCount
 	frames, streamFrames, n, sentStream = f.appendClassStreams(frames, streamFrames, class, maxLen-length, last, v)
 	length += n
-	if !sentStream && maxLen-length >= minClassedStreamFrame && f.refile(class) {
-		// A stream whose class changed without being re-filed: every change
-		// re-files, so this is a safety net, not the way streams move.
-		frames, streamFrames, n, sentStream = f.appendClassStreams(frames, streamFrames, class, maxLen-length, last, v)
-		length += n
-	}
 	if sentStream {
 		if isBlocked, offset := f.connFlowController.IsNewlyBlocked(); isBlocked {
 			blocked := &wire.DataBlockedFrame{MaximumData: offset}
@@ -263,19 +255,17 @@ func (f *framer) appendClassedControlFrames(frames []ackhandler.Frame, maxLen pr
 	return frames, length
 }
 
-// refile files every active stream in the ring of its current class, and
-// says whether one moved into class. It must be called with the mutex held.
-func (f *framer) refile(class congestion.SendClass) bool {
-	var moved bool
-	for id, str := range f.activeStreams {
-		c := classOfStream(str)
-		if e, ok := f.ringOf[id]; ok && e.class == c {
-			continue
-		}
-		f.file(id, c)
-		moved = moved || c == class
+// RefileStream re-files an active stream whose effective class may have
+// changed outside the framer's own pops (a verification grant's build path).
+func (f *framer) RefileStream(id protocol.StreamID, str streamFrameGetter) {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	if !f.classed {
+		return
 	}
-	return moved
+	if _, ok := f.activeStreams[id]; ok {
+		f.fileStream(id, str)
+	}
 }
 
 // appendClassStreams serves the streams filed in class, round-robin, up to
