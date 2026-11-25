@@ -164,3 +164,20 @@ func TestRetransmissionQueueAppendFittingFrames(t *testing.T) {
 	require.Len(t, frames, 2)
 	require.False(t, q.HasData(protocol.Encryption1RTT))
 }
+
+// When only a prefix fits, the frames behind it are not moved: the prefix is
+// dropped by reslicing, as GetFrame does, so draining a long backlog costs
+// no copying of its tail.
+func TestRetransmissionQueueAppendFittingFramesLeavesTheTailInPlace(t *testing.T) {
+	q := newRetransmissionQueue()
+	for i := range 100 {
+		q.addAppData(&wire.MaxStreamsFrame{MaxStreamNum: protocol.StreamNum(1000 + i)})
+	}
+	size := q.appData.other[0].Length(protocol.Version1)
+	backing := q.appData.other
+	frames, _ := q.AppendFittingFrames(nil, 3*size+size/2, protocol.Version1)
+	require.Len(t, frames, 3)
+	require.Len(t, q.appData.other, 97)
+	require.Same(t, &backing[3], &q.appData.other[0], "the tail was moved")
+	require.Equal(t, backing[3], q.appData.other[0])
+}

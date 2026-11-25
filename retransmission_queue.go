@@ -100,40 +100,41 @@ func (q *retransmissionQueue) AppendFittingFrames(frames []ackhandler.Frame, max
 		frames = append(frames, ackhandler.Frame{Frame: newFrame, Handler: handler})
 		used += newFrame.Length(v)
 	}
-	// taken is how many frames from the front were taken before the first
-	// one kept; kept is where the next kept frame goes once one was, which
-	// compacts the queue in place, in order.
-	taken, kept := 0, -1
+	// taken is how many frames were taken from the front before the first
+	// one kept. Frames kept stay where they are until a frame behind them is
+	// taken; from that hole on, write is where the next kept frame moves to,
+	// which compacts the queue in place, in order, at most once per call.
+	taken, keptSeen, write := 0, false, -1
 	for i, f := range r.other {
 		if used >= maxLen {
-			if kept >= 0 {
-				kept += copy(r.other[kept:], r.other[i:])
+			if write >= 0 {
+				write += copy(r.other[write:], r.other[i:])
 			}
 			break
 		}
 		if l := f.Length(v); l <= maxLen-used {
 			frames = append(frames, ackhandler.Frame{Frame: f, Handler: handler})
 			used += l
-			if kept < 0 {
+			switch {
+			case !keptSeen:
 				taken++
+			case write < 0:
+				write = i
 			}
 			continue
 		}
-		if kept < 0 {
-			// Every frame before this one was taken.
-			kept = 0
+		keptSeen = true
+		if write >= 0 {
+			r.other[write] = f
+			write++
 		}
-		r.other[kept] = f
-		kept++
 	}
-	switch {
-	case kept >= 0:
-		clear(r.other[kept:])
-		r.other = r.other[:kept]
-	default:
-		// Only a prefix was taken: drop it in constant time, as GetFrame.
-		r.other = r.other[taken:]
+	end := len(r.other)
+	if write >= 0 {
+		clear(r.other[write:])
+		end = write
 	}
+	r.other = r.other[taken:end]
 	return frames, used
 }
 
