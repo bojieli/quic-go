@@ -3029,6 +3029,15 @@ func (c *Conn) setClassed(on bool) {
 	c.demand = congestion.Demand{}
 }
 
+// permitCoversMTUProbe says whether the packet about to be built may be an
+// MTU probe. Under a class-scheduled permit a probe, larger than an ordinary
+// packet, goes only when the permit's MaxBytes covers the largest probe;
+// otherwise the permit builds ordinary work and the probe waits.
+func (c *Conn) permitCoversMTUProbe() bool {
+	permit, ok := c.currentClassPermit()
+	return !ok || permit.MaxBytes >= congestion.ByteCount(protocol.MaxPacketBufferSize)
+}
+
 // currentClassPermit is the packer's view of the permit the next packet is
 // built under, while the PathSender schedules classes.
 //
@@ -3061,7 +3070,7 @@ func (c *Conn) sendPackets(now monotime.Time) error {
 	// Can't use GSO, since we need to send a single packet that's larger than our current maximum size.
 	// Performance-wise, this doesn't matter, since we only send a very small (<10) number of
 	// MTU probe packets per connection.
-	if c.handshakeConfirmed && c.mtuDiscoverer != nil && c.mtuDiscoverer.ShouldSendProbe(now) {
+	if c.handshakeConfirmed && c.mtuDiscoverer != nil && c.permitCoversMTUProbe() && c.mtuDiscoverer.ShouldSendProbe(now) {
 		ping, size := c.mtuDiscoverer.GetPing(now)
 		p, buf, err := c.packer.PackMTUProbePacket(ping, size, c.version)
 		if err != nil {

@@ -78,6 +78,9 @@ func (q *retransmissionQueue) HasData(encLevel protocol.EncryptionLevel) bool {
 // GetFittingFrame is GetFrame for a class budget on 1-RTT: a frame that does
 // not fit stays queued, in order, and a smaller one behind it is taken.
 func (q *retransmissionQueue) GetFittingFrame(maxLen protocol.ByteCount, v protocol.Version) wire.Frame {
+	if maxLen <= 0 {
+		return nil
+	}
 	r := &q.appData
 	if len(r.crypto) > 0 {
 		f := r.crypto[0]

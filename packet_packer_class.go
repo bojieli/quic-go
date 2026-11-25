@@ -121,7 +121,7 @@ func (p *packetPacker) composeClassedPacket(maxPayloadSize, fullPayload protocol
 		switch class {
 		case congestion.ClassControl:
 			if hasRetransmission {
-				for {
+				for used < limit {
 					f := p.retransmissionQueue.GetFittingFrame(limit-used, v)
 					if f == nil {
 						break
@@ -184,8 +184,17 @@ func (p *packetPacker) permitHasWork(permit congestion.Permit, hasRetransmission
 	if allowed(congestion.ClassControl) && (hasRetransmission || f.HasControlData()) {
 		return true
 	}
-	if allowed(congestion.ClassInteractive) && p.datagramQueue != nil && p.datagramQueue.Peek() != nil {
-		return true
+	if allowed(congestion.ClassInteractive) && p.datagramQueue != nil {
+		// Only a datagram the permit has room for.
+		if d := p.datagramQueue.Peek(); d != nil {
+			budget := protocol.ByteCount(permit.MaxBytes)
+			if permit.Turn != congestion.ClassInteractive {
+				budget = min(budget, protocol.ByteCount(permit.Fill[congestion.ClassInteractive]))
+			}
+			if d.Length(protocol.Version1) <= budget {
+				return true
+			}
+		}
 	}
 	streams := f.StreamDemand(f.connWindowOpen())
 	for _, c := range classOrder {

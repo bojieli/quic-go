@@ -227,3 +227,17 @@ func TestEmptyAdmittedBuildIsReportedToTheScheduler(t *testing.T) {
 		require.NoError(t, <-errChan)
 	})
 }
+
+// An MTU probe goes only under a class permit that covers the largest probe.
+func TestMTUProbeNeedsAPermitThatCoversIt(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	sph := mockackhandler.NewMockSentPacketHandler(mockCtrl)
+	for _, c := range []struct {
+		max  congestion.ByteCount
+		want bool
+	}{{128, false}, {1252, false}, {congestion.ByteCount(protocol.MaxPacketBufferSize), true}} {
+		conn := &Conn{classed: true, handshakeConfirmed: true, sentPacketHandler: permittingHandler{sph, congestion.Permit{OK: true, MaxBytes: c.max}}}
+		require.Equal(t, c.want, conn.permitCoversMTUProbe(), "MaxBytes %d", c.max)
+	}
+	require.True(t, (&Conn{}).permitCoversMTUProbe(), "without class scheduling probes are as before")
+}

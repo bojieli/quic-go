@@ -683,3 +683,16 @@ func TestClassedBuilderTakesNoEarlyAckForWorkThePermitExcludes(t *testing.T) {
 	h.packer.composeClassedPacket(testPayload, testPayload, congestion.Permit{OK: true, Turn: congestion.ClassBulk, MaxBytes: 1252}, true, monotime.Now(), protocol.Version1)
 	require.Equal(t, []bool{true, false}, acks.onlyIfQueued, "only a permit that lets the BULK data in may take an ACK early")
 }
+
+// A datagram too large for the INTERACTIVE fill is no reason to take an ACK
+// early: the permit cannot carry it.
+func TestClassedBuilderTakesNoEarlyAckForADatagramThatCannotFit(t *testing.T) {
+	h := newBuilderHarness(true)
+	acks := &recordingAcks{}
+	h.packer.acks = acks
+	h.datagram(900, 1)
+	h.packer.composeClassedPacket(testPayload, testPayload, congestion.Permit{OK: true, Turn: congestion.ClassBulk, MaxBytes: 1252,
+		Fill: [congestion.NumSendClasses]congestion.ByteCount{congestion.ClassInteractive: 100}}, true, monotime.Now(), protocol.Version1)
+	require.Equal(t, []bool{true}, acks.onlyIfQueued)
+	require.NotNil(t, h.dq.Peek())
+}
