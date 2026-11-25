@@ -577,3 +577,49 @@ func TestExemptTurnKeepsOverheadOutOfTheFill(t *testing.T) {
 	require.Equal(t, congestion.ByteCount(bulk.Length(protocol.Version1)), got[congestion.ClassBulk])
 	require.Equal(t, 150-got[congestion.ClassBulk], got[congestion.ClassExempt])
 }
+
+// A probe-timeout episode is counted where it ends, with its peak, so a
+// reader of the snapshot that only sees the reset count afterwards still
+// learns how far the episode went. This holds with and without a
+// PathSender.
+func TestProgressRecordsCompletedPTOEpisodes(t *testing.T) {
+	for _, withPathSender := range []bool{false, true} {
+		sph := NewSentPacketHandler(0, 1200, utils.NewRTTStats(), &utils.ConnectionStats{}, true, false, nil, protocol.PerspectiveClient, false, nil, utils.DefaultLogger).(*sentPacketHandler)
+		if withPathSender {
+			sph.InstallPathSender(newRecordingPathSender(), monotime.Now(), func() {})
+		}
+		sph.DropPackets(protocol.EncryptionInitial, monotime.Now())
+		sph.DropPackets(protocol.EncryptionHandshake, monotime.Now())
+		var tr packetTracker
+		now := monotime.Now()
+		// episode runs ptos probe timeouts, then acknowledges a packet.
+		episode := func(ptos int) {
+			pn := sendPing(sph, &tr, now, protocol.Encryption1RTT, 1000)
+			for range ptos {
+				require.NoError(t, sph.OnLossDetectionTimeout(sph.GetLossDetectionTimeout()))
+			}
+			require.Equal(t, uint32(ptos), sph.connStats.Progress().PTOExpiries)
+			now = now.Add(time.Second)
+			_, err := sph.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(pn)}, protocol.Encryption1RTT, now)
+			require.NoError(t, err)
+		}
+		episode(3)
+		p := sph.connStats.Progress()
+		require.Zero(t, p.PTOExpiries, "progress resets the count")
+		require.Equal(t, uint64(1), p.PTOEpisodes)
+		require.Equal(t, uint32(3), p.LastEpisodePeak)
+		require.Equal(t, [utils.PTOEpisodeBuckets]uint64{1, 1, 1}, p.EpisodesReaching)
+
+		episode(0) // progress without a probe timeout is no episode
+		episode(1)
+		episode(17)
+		p = sph.connStats.Progress()
+		require.Equal(t, uint64(3), p.PTOEpisodes, "with a PathSender: %v", withPathSender)
+		require.Equal(t, uint32(17), p.LastEpisodePeak)
+		want := [utils.PTOEpisodeBuckets]uint64{3, 2, 2}
+		for i := 3; i < utils.PTOEpisodeBuckets; i++ {
+			want[i] = 1
+		}
+		require.Equal(t, want, p.EpisodesReaching, "an episode past the last bucket is counted in it")
+	}
+}

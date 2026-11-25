@@ -58,6 +58,15 @@ func (h *receivedPacketTracker) GetAckFrame() *wire.AckFrame {
 	if ack == nil {
 		ack = &wire.AckFrame{}
 	}
+	h.fillAckFrame(ack)
+
+	h.lastAck = ack
+	h.hasNewAck = false
+	return ack
+}
+
+// fillAckFrame fills ack with the ACK frame for the packets received so far.
+func (h *receivedPacketTracker) fillAckFrame(ack *wire.AckFrame) {
 	ack.Reset()
 	ack.ECT0 = h.ect0
 	ack.ECT1 = h.ect1
@@ -65,10 +74,6 @@ func (h *receivedPacketTracker) GetAckFrame() *wire.AckFrame {
 	for r := range h.packetHistory.Backward() {
 		ack.AckRanges = append(ack.AckRanges, wire.AckRange{Smallest: r.Start, Largest: r.End})
 	}
-
-	h.lastAck = ack
-	h.hasNewAck = false
-	return ack
 }
 
 func (h *receivedPacketTracker) IsPotentiallyDuplicate(pn protocol.PacketNumber) bool {

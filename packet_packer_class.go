@@ -81,7 +81,7 @@ func (p *packetPacker) composeClassedPacket(maxPayloadSize, fullPayload protocol
 	if ackAllowed {
 		// An ACK that is not yet due is taken only if work this permit
 		// allows can ride with it.
-		early := p.permitHasWork(permit, hasRetransmission)
+		early := p.permitHasWork(permit, hasRetransmission, maxPayloadSize, now, v)
 		if ack := p.acks.GetAckFrame(protocol.Encryption1RTT, now, !early); ack != nil {
 			ack.Truncate(maxPayloadSize, v)
 			pl.ack = ack
@@ -121,14 +121,9 @@ func (p *packetPacker) composeClassedPacket(maxPayloadSize, fullPayload protocol
 		switch class {
 		case congestion.ClassControl:
 			if hasRetransmission {
-				for used < limit {
-					f := p.retransmissionQueue.GetFittingFrame(limit-used, v)
-					if f == nil {
-						break
-					}
-					pl.frames = append(pl.frames, ackhandler.Frame{Frame: f, Handler: p.retransmissionQueue.AckHandler(protocol.Encryption1RTT)})
-					used += f.Length(v)
-				}
+				var n protocol.ByteCount
+				pl.frames, n = p.retransmissionQueue.AppendFittingFrames(pl.frames, limit, v)
+				used += n
 			}
 		case congestion.ClassInteractive:
 			used += p.appendClassedDatagram(&pl, limit, maxPayloadSize, fullPayload, class == permit.Turn, v)
@@ -168,7 +163,9 @@ func (p *packetPacker) composeClassedPacket(maxPayloadSize, fullPayload protocol
 
 // permitHasWork says whether there is work a permit allows into a packet:
 // an exempt obligation, or work of its turn or of a class it lists in Fill.
-func (p *packetPacker) permitHasWork(permit congestion.Permit, hasRetransmission bool) bool {
+// maxPayloadSize is the packet's payload budget: the permit's MaxBytes less
+// the header and the AEAD tag.
+func (p *packetPacker) permitHasWork(permit congestion.Permit, hasRetransmission bool, maxPayloadSize protocol.ByteCount, now monotime.Time, v protocol.Version) bool {
 	if p.framer.HasExemptData() {
 		return true
 	}
@@ -185,13 +182,15 @@ func (p *packetPacker) permitHasWork(permit congestion.Permit, hasRetransmission
 		return true
 	}
 	if allowed(congestion.ClassInteractive) && p.datagramQueue != nil {
-		// Only a datagram the permit has room for.
+		// Only a datagram the packet has room for beside the ACK that
+		// would be taken for it, within its fill allowance.
 		if d := p.datagramQueue.Peek(); d != nil {
-			budget := protocol.ByteCount(permit.MaxBytes)
+			budget := maxPayloadSize
 			if permit.Turn != congestion.ClassInteractive {
 				budget = min(budget, protocol.ByteCount(permit.Fill[congestion.ClassInteractive]))
 			}
-			if d.Length(protocol.Version1) <= budget {
+			// The ACK is only measured for a datagram that fits otherwise.
+			if l := d.Length(v); l <= budget && l <= maxPayloadSize-p.ackFrameLength(now, maxPayloadSize, v) {
 				return true
 			}
 		}
@@ -203,6 +202,19 @@ func (p *packetPacker) permitHasWork(permit congestion.Permit, hasRetransmission
 		}
 	}
 	return false
+}
+
+// ackFrameLength is the length of the 1-RTT ACK frame a packet with
+// maxPayloadSize bytes of payload built now would take early, truncated as
+// the builder truncates it, without taking it; zero if the ACK source cannot
+// say.
+func (p *packetPacker) ackFrameLength(now monotime.Time, maxPayloadSize protocol.ByteCount, v protocol.Version) protocol.ByteCount {
+	if a, ok := p.acks.(interface {
+		AckFrameLength(monotime.Time, protocol.ByteCount, protocol.Version) protocol.ByteCount
+	}); ok {
+		return a.AckFrameLength(now, maxPayloadSize, v)
+	}
+	return 0
 }
 
 // appendClassedDatagram adds the queued DATAGRAM frame if it fits within

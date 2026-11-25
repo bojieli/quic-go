@@ -142,3 +142,24 @@ func TestPacketDuplicateDetection(t *testing.T) {
 	require.NoError(t, handler.ReceivedPacket(4, protocol.ECNNon, protocol.Encryption1RTT, sendTime, true))
 	require.True(t, handler.IsPotentiallyDuplicate(4, protocol.Encryption1RTT))
 }
+
+// The length of the ACK a builder would take early is read without taking
+// it, truncated as the builder truncates it.
+func TestReceivedPacketHandlerAckFrameLength(t *testing.T) {
+	h := NewReceivedPacketHandler(utils.DefaultLogger)
+	now := monotime.Now()
+	require.Zero(t, h.AckFrameLength(now, 1000, protocol.Version1), "nothing to acknowledge")
+	require.NoError(t, h.ReceivedPacket(0, protocol.ECNNon, protocol.Encryption1RTT, now, true))
+	for pn := protocol.PacketNumber(1000); pn < 1000*60; pn += 1000 {
+		require.NoError(t, h.ReceivedPacket(pn, protocol.ECNNon, protocol.Encryption1RTT, now, false))
+	}
+	full := h.AckFrameLength(now, 10000, protocol.Version1)
+	require.Greater(t, full, protocol.ByteCount(100))
+	short := h.AckFrameLength(now, 100, protocol.Version1)
+	require.LessOrEqual(t, short, protocol.ByteCount(100), "truncated to the room given")
+	ack := h.GetAckFrame(protocol.Encryption1RTT, now, false)
+	require.NotNil(t, ack, "reading the length consumed nothing")
+	require.Equal(t, full, ack.Length(protocol.Version1))
+	ack.Truncate(100, protocol.Version1)
+	require.Equal(t, short, ack.Length(protocol.Version1))
+}

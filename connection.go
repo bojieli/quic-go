@@ -928,7 +928,25 @@ type ConnectionStats struct {
 	// ElicitingOutstanding says an ack-eliciting application-data packet is
 	// outstanding.
 	ElicitingOutstanding bool
+	// A probe-timeout episode is a run of one or more probe timeouts that
+	// ends when ProgressEpoch next moves; its peak is
+	// PTOExpiriesSinceProgress just before that. The episode fields are kept
+	// as each episode ends, so a reader that polls the snapshot still counts
+	// an episode that opened and closed between two reads.
+	//
+	// PTOEpisodes counts completed episodes. It only grows.
+	PTOEpisodes uint64
+	// LastPTOEpisodePeak is the peak of the last completed episode.
+	LastPTOEpisodePeak uint32
+	// PTOEpisodesReaching[n-1] counts completed episodes whose peak reached
+	// n probe timeouts; the last bucket counts every episode that reached
+	// PTOEpisodeBuckets or more. Every bucket only grows.
+	PTOEpisodesReaching [PTOEpisodeBuckets]uint64
 }
+
+// PTOEpisodeBuckets is the number of buckets of
+// ConnectionStats.PTOEpisodesReaching.
+const PTOEpisodeBuckets = utils.PTOEpisodeBuckets
 
 func (c *Conn) ConnectionStats() ConnectionStats {
 	stats := ConnectionStats{
@@ -951,6 +969,9 @@ func (c *Conn) ConnectionStats() ConnectionStats {
 	}
 	stats.PTOExpiriesSinceProgress = progress.PTOExpiries
 	stats.ElicitingOutstanding = progress.ElicitingOutstanding
+	stats.PTOEpisodes = progress.PTOEpisodes
+	stats.LastPTOEpisodePeak = progress.LastEpisodePeak
+	stats.PTOEpisodesReaching = progress.EpisodesReaching
 	return stats
 }
 
@@ -2675,7 +2696,10 @@ func (c *Conn) triggerSending(now monotime.Time) error {
 		c.updateDemand()
 	}
 
-	sendMode := c.sentPacketHandler.SendMode(now)
+	sendMode, probeRetry := c.admitFirstPacket(now)
+	if !probeRetry.IsZero() {
+		defer c.armMTUProbeRetry(now, probeRetry)
+	}
 	switch sendMode {
 	case ackhandler.SendAny:
 		return c.sendPackets(now)
@@ -3029,13 +3053,77 @@ func (c *Conn) setClassed(on bool) {
 	c.demand = congestion.Demand{}
 }
 
-// permitCoversMTUProbe says whether the packet about to be built may be an
-// MTU probe. Under a class-scheduled permit a probe, larger than an ordinary
-// packet, goes only when the permit's MaxBytes covers the largest probe;
+// admitFirstPacket is SendMode for the first packet of a send pass. While an
+// MTU probe is due on a class-scheduled connection, admission is asked for
+// the probe's size, which is larger than an ordinary packet: a scheduler that
+// grants what it is asked would otherwise never issue a permit the probe
+// fits. The probe is not taken from the discoverer, so not in flight, until a
+// permit covers it. A scheduler may refuse the probe's size, or grant less
+// than it, and still admit an ordinary packet in full, so a refusal or a
+// permit that does not cover the probe is followed by an ordinary admission,
+// and the probe stays due. probeRetry is when the scheduler said the probe's
+// refusal may clear, or zero.
+func (c *Conn) admitFirstPacket(now monotime.Time) (_ ackhandler.SendMode, probeRetry monotime.Time) {
+	if !c.requestMTUProbeAdmission(now) {
+		return c.sentPacketHandler.SendMode(now), 0
+	}
+	mode := c.sentPacketHandler.SendMode(now)
+	if mode == ackhandler.SendAny {
+		if c.permitCoversMTUProbe() {
+			return mode, 0
+		}
+		// A permit too short for the probe is asked for again at the
+		// ordinary size, which the scheduler may grant in full.
+		return c.sentPacketHandler.SendMode(now), 0
+	}
+	if !c.sentPacketHandler.AdmissionRefused() {
+		return mode, 0
+	}
+	if mode == ackhandler.SendPacingLimited {
+		probeRetry = c.sentPacketHandler.TimeUntilSend()
+	}
+	return c.sentPacketHandler.SendMode(now), probeRetry
+}
+
+// armMTUProbeRetry makes sure the connection wakes when a refused MTU probe
+// may be admitted, if the probe is still due when the send pass ends: the
+// ordinary admission that followed the refusal replaced its retry time. A
+// window refusal of the ordinary packet leaves the connection congestion
+// limited, which arms no pacing timer; with a PathSender that mode decides
+// nothing else, so it is lifted for the probe's retry.
+func (c *Conn) armMTUProbeRetry(now, at monotime.Time) {
+	if !c.mtuDiscoverer.ShouldSendProbe(now) {
+		return
+	}
+	if c.pacingDeadline.IsZero() || at.Before(c.pacingDeadline) {
+		c.pacingDeadline = at
+	}
+	if c.blocked == blockModeCongestionLimited {
+		c.blocked = blockModeNone
+	}
+}
+
+// requestMTUProbeAdmission asks the next admission to cover the MTU probe
+// that is due, and reports whether it did.
+func (c *Conn) requestMTUProbeAdmission(now monotime.Time) bool {
+	if c.pathSender == nil || !c.classed || !c.handshakeConfirmed || c.mtuDiscoverer == nil || !c.mtuDiscoverer.ShouldSendProbe(now) {
+		return false
+	}
+	r, ok := c.sentPacketHandler.(interface{ RequestAdmission(protocol.ByteCount) })
+	if !ok {
+		return false
+	}
+	r.RequestAdmission(c.mtuDiscoverer.NextProbeSize())
+	return true
+}
+
+// permitCoversMTUProbe says whether the packet about to be built may be the
+// MTU probe that is due. Under a class-scheduled permit a probe, larger than
+// an ordinary packet, goes only when the permit's MaxBytes covers it;
 // otherwise the permit builds ordinary work and the probe waits.
 func (c *Conn) permitCoversMTUProbe() bool {
 	permit, ok := c.currentClassPermit()
-	return !ok || permit.MaxBytes >= congestion.ByteCount(protocol.MaxPacketBufferSize)
+	return !ok || permit.MaxBytes >= congestion.ByteCount(c.mtuDiscoverer.NextProbeSize())
 }
 
 // currentClassPermit is the packer's view of the permit the next packet is
@@ -3070,7 +3158,7 @@ func (c *Conn) sendPackets(now monotime.Time) error {
 	// Can't use GSO, since we need to send a single packet that's larger than our current maximum size.
 	// Performance-wise, this doesn't matter, since we only send a very small (<10) number of
 	// MTU probe packets per connection.
-	if c.handshakeConfirmed && c.mtuDiscoverer != nil && c.permitCoversMTUProbe() && c.mtuDiscoverer.ShouldSendProbe(now) {
+	if c.handshakeConfirmed && c.mtuDiscoverer != nil && c.mtuDiscoverer.ShouldSendProbe(now) && c.permitCoversMTUProbe() {
 		ping, size := c.mtuDiscoverer.GetPing(now)
 		p, buf, err := c.packer.PackMTUProbePacket(ping, size, c.version)
 		if err != nil {

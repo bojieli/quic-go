@@ -119,6 +119,44 @@ func (c *MockMTUDiscovererGetPingCall) DoAndReturn(f func(monotime.Time) (ackhan
 	return c
 }
 
+// NextProbeSize mocks base method.
+func (m *MockMTUDiscoverer) NextProbeSize() protocol.ByteCount {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "NextProbeSize")
+	ret0, _ := ret[0].(protocol.ByteCount)
+	return ret0
+}
+
+// NextProbeSize indicates an expected call of NextProbeSize.
+func (mr *MockMTUDiscovererMockRecorder) NextProbeSize() *MockMTUDiscovererNextProbeSizeCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "NextProbeSize", reflect.TypeOf((*MockMTUDiscoverer)(nil).NextProbeSize))
+	return &MockMTUDiscovererNextProbeSizeCall{Call: call}
+}
+
+// MockMTUDiscovererNextProbeSizeCall wrap *gomock.Call
+type MockMTUDiscovererNextProbeSizeCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockMTUDiscovererNextProbeSizeCall) Return(arg0 protocol.ByteCount) *MockMTUDiscovererNextProbeSizeCall {
+	c.Call = c.Call.Return(arg0)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockMTUDiscovererNextProbeSizeCall) Do(f func() protocol.ByteCount) *MockMTUDiscovererNextProbeSizeCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockMTUDiscovererNextProbeSizeCall) DoAndReturn(f func() protocol.ByteCount) *MockMTUDiscovererNextProbeSizeCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
 // Reset mocks base method.
 func (m *MockMTUDiscoverer) Reset(now monotime.Time, start, max protocol.ByteCount) {
 	m.ctrl.T.Helper()

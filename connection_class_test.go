@@ -12,6 +12,7 @@ import (
 	mockackhandler "github.com/apernet/quic-go/internal/mocks/ackhandler"
 	"github.com/apernet/quic-go/internal/monotime"
 	"github.com/apernet/quic-go/internal/protocol"
+	"github.com/apernet/quic-go/internal/utils"
 	"github.com/apernet/quic-go/internal/wire"
 
 	"github.com/stretchr/testify/require"
@@ -228,16 +229,166 @@ func TestEmptyAdmittedBuildIsReportedToTheScheduler(t *testing.T) {
 	})
 }
 
-// An MTU probe goes only under a class permit that covers the largest probe.
+// An MTU probe goes only under a class permit that covers the probe that is
+// due.
 func TestMTUProbeNeedsAPermitThatCoversIt(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	sph := mockackhandler.NewMockSentPacketHandler(mockCtrl)
+	mtu := newMTUDiscoverer(utils.NewRTTStats(), 1200, protocol.MaxPacketBufferSize, nil)
+	probe := congestion.ByteCount(mtu.NextProbeSize())
 	for _, c := range []struct {
 		max  congestion.ByteCount
 		want bool
-	}{{128, false}, {1252, false}, {congestion.ByteCount(protocol.MaxPacketBufferSize), true}} {
-		conn := &Conn{classed: true, handshakeConfirmed: true, sentPacketHandler: permittingHandler{sph, congestion.Permit{OK: true, MaxBytes: c.max}}}
+	}{{128, false}, {probe - 1, false}, {probe, true}, {congestion.ByteCount(protocol.MaxPacketBufferSize), true}} {
+		conn := &Conn{classed: true, handshakeConfirmed: true, mtuDiscoverer: mtu, sentPacketHandler: permittingHandler{sph, congestion.Permit{OK: true, MaxBytes: c.max}}}
 		require.Equal(t, c.want, conn.permitCoversMTUProbe(), "MaxBytes %d", c.max)
 	}
 	require.True(t, (&Conn{}).permitCoversMTUProbe(), "without class scheduling probes are as before")
+}
+
+// exactGrantScheduler is a class scheduler that grants exactly the size it is
+// asked to admit, up to limit when one is set, and refuses a larger request.
+type exactGrantScheduler struct {
+	demandRecorder
+	limit   congestion.ByteCount
+	retryAt monotime.Time // when set, a request over limit is a pacing refusal
+	// closed refuses requests within limit too, as a window refusal.
+	closed bool
+	// short grants a request over limit only this many bytes.
+	short congestion.ByteCount
+	asked  []congestion.ByteCount
+}
+
+func (s *exactGrantScheduler) SchedulesClasses() bool { return true }
+func (s *exactGrantScheduler) Admit(_ monotime.Time, maxBytes congestion.ByteCount) congestion.Permit {
+	s.asked = append(s.asked, maxBytes)
+	if s.limit > 0 && maxBytes > s.limit && s.short > 0 {
+		return congestion.Permit{OK: true, Turn: congestion.ClassBulk, MaxBytes: s.short}
+	}
+	if s.limit > 0 && maxBytes > s.limit {
+		return congestion.Permit{RetryAt: s.retryAt} // a window refusal, or a pacing one with retryAt
+	}
+	if s.closed {
+		return congestion.Permit{}
+	}
+	return congestion.Permit{OK: true, Turn: congestion.ClassBulk, MaxBytes: maxBytes}
+}
+
+func newMTUProbeConn(t *testing.T, ps *exactGrantScheduler) (*Conn, *mtuFinder, ackhandler.SentPacketHandler) {
+	t.Helper()
+	rtt := utils.NewRTTStats()
+	sph := ackhandler.NewSentPacketHandler(0, 1200, rtt, &utils.ConnectionStats{}, true, false, nil, protocol.PerspectiveClient, false, nil, utils.DefaultLogger)
+	now := monotime.Now()
+	sph.DropPackets(protocol.EncryptionInitial, now)
+	sph.DropPackets(protocol.EncryptionHandshake, now)
+	sph.InstallPathSender(ps, now, func() {})
+	mtu := newMTUDiscoverer(rtt, 1200, protocol.MaxPacketBufferSize, nil)
+	mtu.Start(now.Add(-time.Hour))
+	require.True(t, mtu.ShouldSendProbe(now))
+	require.Greater(t, mtu.NextProbeSize(), protocol.ByteCount(1200))
+	return &Conn{classed: true, handshakeConfirmed: true, mtuDiscoverer: mtu, sentPacketHandler: sph, pathSender: ps}, mtu, sph
+}
+
+// A scheduler that grants exactly what it is asked still lets MTU discovery
+// send its first probe: while a probe is due, admission is asked for the
+// probe's size. The probe is not taken from the discoverer -- not in flight
+// -- by asking, and the request lasts one admission.
+func TestMTUProbeIsAdmittedAtItsOwnSize(t *testing.T) {
+	ps := &exactGrantScheduler{}
+	conn, mtu, sph := newMTUProbeConn(t, ps)
+	now := monotime.Now()
+	probe := congestion.ByteCount(mtu.NextProbeSize())
+
+	mode, retry := conn.admitFirstPacket(now)
+	require.Equal(t, ackhandler.SendAny, mode)
+	require.Zero(t, retry)
+	require.Equal(t, []congestion.ByteCount{probe}, ps.asked)
+	require.True(t, conn.permitCoversMTUProbe(), "the permit covers the probe")
+	require.True(t, mtu.ShouldSendProbe(now), "asking for admission does not put the probe in flight")
+
+	require.Equal(t, ackhandler.SendAny, sph.SendMode(now))
+	require.Equal(t, congestion.ByteCount(1200), ps.asked[1], "the request lasts one admission")
+	require.False(t, conn.permitCoversMTUProbe())
+
+	// No probe due: ordinary admissions.
+	_, _ = mtu.GetPing(now)
+	mode, _ = conn.admitFirstPacket(now)
+	require.Equal(t, ackhandler.SendAny, mode)
+	require.Equal(t, congestion.ByteCount(1200), ps.asked[2])
+}
+
+// A scheduler that refuses the probe's size but would admit an ordinary
+// packet is asked again at the ordinary size, so a due probe never holds up
+// ordinary traffic. The probe stays due, and a pass that ends with it still
+// due wakes when the scheduler said the probe's refusal may clear.
+func TestRefusedMTUProbeFallsBackToOrdinaryAdmission(t *testing.T) {
+	for _, pacing := range []bool{false, true} {
+		ps := &exactGrantScheduler{limit: 1200}
+		conn, mtu, _ := newMTUProbeConn(t, ps)
+		now := monotime.Now()
+		if pacing {
+			ps.retryAt = now.Add(10 * time.Millisecond)
+		}
+		probe := congestion.ByteCount(mtu.NextProbeSize())
+		mode, retry := conn.admitFirstPacket(now)
+		require.Equal(t, ackhandler.SendAny, mode)
+		require.Equal(t, []congestion.ByteCount{probe, 1200}, ps.asked)
+		require.False(t, conn.permitCoversMTUProbe(), "the ordinary permit does not carry the probe")
+		require.True(t, mtu.ShouldSendProbe(now), "the probe stays due")
+		require.Equal(t, ps.retryAt, retry, "pacing refusal: %v", pacing)
+		if pacing {
+			conn.armMTUProbeRetry(now, retry)
+			require.Equal(t, ps.retryAt, conn.pacingDeadline, "the probe's retry time survives the ordinary admission")
+			conn.pacingDeadline = deadlineSendImmediately
+			conn.armMTUProbeRetry(now, retry)
+			require.Equal(t, deadlineSendImmediately, conn.pacingDeadline, "an earlier wake is kept")
+		}
+	}
+}
+
+// A probe the scheduler paces, on a connection whose ordinary admission is
+// window-limited, still wakes the connection when the probe may go: the
+// armed timer fires at the probe's retry time.
+func TestRefusedMTUProbeRetryArmsTheTimer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ps := &exactGrantScheduler{limit: 1200, closed: true}
+		conn, mtu, _ := newMTUProbeConn(t, ps)
+		now := monotime.Now()
+		ps.retryAt = now.Add(10 * time.Millisecond)
+		conn.config = populateConfig(&Config{})
+		conn.rttStats = utils.NewRTTStats()
+		conn.handshakeComplete = true
+		conn.idleTimeout = time.Hour
+		conn.lastPacketReceivedTime = now
+		conn.timer = time.NewTimer(time.Hour)
+		mode, retry := conn.admitFirstPacket(now)
+		require.Equal(t, ackhandler.SendAck, mode, "the ordinary admission is window-limited")
+		require.Equal(t, ps.retryAt, retry)
+		conn.blocked = blockModeCongestionLimited // as triggerSending sets it
+		conn.armMTUProbeRetry(now, retry)
+		require.True(t, mtu.ShouldSendProbe(now))
+		conn.maybeResetTimer()
+		time.Sleep(10*time.Millisecond + time.Nanosecond)
+		select {
+		case <-conn.timer.C:
+		default:
+			t.Fatal("no timer armed for the probe's retry")
+		}
+	})
+}
+
+// A permit granted for the probe's size but too short to carry the probe is
+// followed by an ordinary admission, which the scheduler may grant in full:
+// work that fits an ordinary packet is not held behind the probe.
+func TestShortMTUProbePermitFallsBackToOrdinaryAdmission(t *testing.T) {
+	ps := &exactGrantScheduler{limit: 1200, short: 128}
+	conn, mtu, _ := newMTUProbeConn(t, ps)
+	now := monotime.Now()
+	mode, retry := conn.admitFirstPacket(now)
+	require.Equal(t, ackhandler.SendAny, mode)
+	require.Zero(t, retry)
+	require.Equal(t, []congestion.ByteCount{congestion.ByteCount(mtu.NextProbeSize()), 1200}, ps.asked)
+	permit, _ := conn.currentClassPermit()
+	require.Equal(t, congestion.ByteCount(1200), permit.MaxBytes, "the ordinary permit is the one built under")
+	require.True(t, mtu.ShouldSendProbe(now), "the probe stays due")
 }

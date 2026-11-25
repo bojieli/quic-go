@@ -398,16 +398,19 @@ func (f *framer) appendClassStreams(
 	f.serving = true
 	defer func() { f.serving = false }()
 	tries := ring.Len()
-	if maxLen < smallClassBudget && f.boundSmallScans {
-		// A budget this small may fit no stream's frame. When the packet
-		// already carries work, offer it to a few streams, in turn, rather
-		// than walk the whole ring every packet; the round-robin order
-		// still moves on. A packet with nothing in it yet is never declared
-		// empty on a partial scan.
-		tries = min(tries, smallBudgetTries)
-	}
-	for range tries {
+	bounded := false
+	for i := 0; i < tries; i++ {
 		remaining := maxLen - length
+		if !bounded && remaining < smallClassBudget && (f.boundSmallScans || length > 0) {
+			// A budget this small may fit no stream's frame. When the
+			// packet already carries work -- from before this pass or taken
+			// earlier in it -- offer it to a few more streams, in turn,
+			// rather than walk the whole ring every packet; the round-robin
+			// order still moves on. A packet with nothing in it yet is never
+			// declared empty on a partial scan.
+			bounded = true
+			tries = min(tries, i+smallBudgetTries)
+		}
 		if remaining < minStreamFrameLen {
 			// The stream's own frame sizing decides what fits a small
 			// budget, but no STREAM frame fits below this.
