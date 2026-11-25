@@ -109,6 +109,10 @@ type sentPacketHandler struct {
 	pathSender congestionExt.PathSender
 	// permit is the answer to the last Admit. It covers the next packet only.
 	permit congestionExt.Permit
+	// classed says the installed PathSender schedules classes
+	// (congestion.ClassScheduler): packets are classed by the class their
+	// bytes were served at, and overhead is charged to the permit's turn.
+	classed bool
 	// admissionRefused says the last SendMode refused for the PathSender,
 	// not for a transport limit.
 	admissionRefused bool
@@ -1563,6 +1567,7 @@ func (h *sentPacketHandler) SetCongestionControl(cc congestionExt.CongestionCont
 	h.congestionMutex.Lock()
 	old := h.pathSender
 	h.pathSender = nil
+	h.classed = false
 	cc.SetRTTStatsProvider(h.rttStats)
 	if ccEx, isEx := cc.(congestionExt.CongestionControlEx); isEx {
 		h.congestion = &ccAdapterEx{ccEx}
@@ -1593,6 +1598,7 @@ func (h *sentPacketHandler) InstallPathSender(ps congestionExt.PathSender, now m
 	h.congestionMutex.Lock()
 	h.congestion = &ccAdapter{ps}
 	h.pathSender = ps
+	h.classed = SchedulesClasses(ps)
 	h.permit = congestionExt.Permit{}
 	h.controllerGen++
 	h.congestionMutex.Unlock()
@@ -1603,6 +1609,7 @@ func (h *sentPacketHandler) DetachPathSender(now monotime.Time) {
 	h.congestionMutex.Lock()
 	ps := h.pathSender
 	h.pathSender = nil
+	h.classed = false
 	h.congestionMutex.Unlock()
 	if ps != nil {
 		ps.OnDetach(now)
@@ -1613,6 +1620,19 @@ func (h *sentPacketHandler) DetachPathSender(now monotime.Time) {
 // refused admission. A transport limit (the outstanding-packet limit) is not
 // an admission refusal, and grants the exempt path no more than an ACK.
 func (h *sentPacketHandler) AdmissionRefused() bool { return h.admissionRefused }
+
+// SchedulesClasses says whether a PathSender asks the builder to execute
+// its class decisions.
+func SchedulesClasses(ps congestionExt.PathSender) bool {
+	cs, ok := ps.(congestionExt.ClassScheduler)
+	return ok && cs.SchedulesClasses()
+}
+
+// Permit is the permit the next packet is built under, and whether the
+// installed PathSender schedules classes. Run loop only.
+func (h *sentPacketHandler) Permit() (congestionExt.Permit, bool) {
+	return h.permit, h.classed && h.pathSender != nil
+}
 
 // ExpectGrantedPacket says the next packet was built under a verification
 // grant.
@@ -1717,7 +1737,12 @@ func (h *sentPacketHandler) sentPacketInfo(t monotime.Time, encLevel protocol.En
 	info.ClassBytes[congestionExt.ClassExempt] += congestionExt.ByteCount(framed)
 	for _, f := range p.StreamFrames {
 		n := f.Frame.Length(protocol.Version1)
-		info.ClassBytes[congestionExt.ClassBulk] += congestionExt.ByteCount(n)
+		class := congestionExt.ClassBulk
+		if h.classed && f.Frame.Class != 0 {
+			// The class the bytes were served at.
+			class = congestionExt.SendClass(f.Frame.Class)
+		}
+		info.ClassBytes[class] += congestionExt.ByteCount(n)
 		framed += n
 	}
 	for _, f := range p.Frames {
@@ -1733,13 +1758,25 @@ func (h *sentPacketHandler) sentPacketInfo(t monotime.Time, encLevel protocol.En
 			info.ClassBytes[congestionExt.ClassControl] += congestionExt.ByteCount(n)
 		}
 	}
+	if h.classed && p.IsPathMTUProbePacket {
+		// An MTU probe is INTERACTIVE work, whatever it is made of.
+		info.ClassBytes = [congestionExt.NumSendClasses]congestionExt.ByteCount{}
+		info.ClassBytes[congestionExt.ClassExempt] = congestionExt.ByteCount(min(ackLen, p.Length))
+		info.ClassBytes[congestionExt.ClassInteractive] = congestionExt.ByteCount(p.Length) - info.ClassBytes[congestionExt.ClassExempt]
+		return info
+	}
 	if framed < p.Length {
 		overhead := congestionExt.ByteCount(p.Length - framed)
 		class := congestionExt.ClassExempt
-		for _, c := range []congestionExt.SendClass{congestionExt.ClassControl, congestionExt.ClassInteractive, congestionExt.ClassBulk} {
-			if info.ClassBytes[c] > 0 {
-				class = c
-				break
+		if turn := h.permit.Turn; h.classed && !exempt && h.permit.OK && turn != congestionExt.ClassExempt && turn < congestionExt.NumSendClasses && info.ClassBytes[turn] > 0 {
+			// A class-scheduled packet's overhead is its turn's.
+			class = turn
+		} else {
+			for _, c := range []congestionExt.SendClass{congestionExt.ClassControl, congestionExt.ClassInteractive, congestionExt.ClassBulk} {
+				if info.ClassBytes[c] > 0 {
+					class = c
+					break
+				}
 			}
 		}
 		info.ClassBytes[class] += overhead

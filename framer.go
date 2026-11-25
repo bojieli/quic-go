@@ -4,6 +4,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/apernet/quic-go/congestion"
 	"github.com/apernet/quic-go/internal/ackhandler"
 	"github.com/apernet/quic-go/internal/monotime"
 	"github.com/apernet/quic-go/internal/protocol"
@@ -36,6 +37,15 @@ type framer struct {
 	streamQueue              ringbuffer.RingBuffer[protocol.StreamID]
 	streamsWithControlFrames map[protocol.StreamID]streamControlFrameGetter
 
+	// classed is set while the connection's PathSender schedules classes.
+	// Active streams are then queued in classRings by effective class
+	// instead of in streamQueue, round-robin within a class. ringOf is the
+	// ring each active stream is filed in; an entry in another ring is stale
+	// and skipped. See framer_class.go.
+	classed    bool
+	classRings [congestion.NumSendClasses]ringbuffer.RingBuffer[protocol.StreamID]
+	ringOf     map[protocol.StreamID]congestion.SendClass
+
 	controlFrameMutex sync.Mutex
 	controlFrames     []wire.Frame
 	// exemptFrames are obligations that may be sent without a permit, such
@@ -56,7 +66,7 @@ func newFramer(connFlowController *connectionFlowController) *framer {
 
 func (f *framer) HasData() bool {
 	f.mutex.Lock()
-	hasData := !f.streamQueue.Empty()
+	hasData := !f.streamQueue.Empty() || (f.classed && f.hasClassedStreams())
 	f.mutex.Unlock()
 	if hasData {
 		return true
@@ -289,6 +299,11 @@ func (f *framer) QueuedTooManyControlFrames() bool {
 
 func (f *framer) AddActiveStream(id protocol.StreamID, str streamFrameGetter) {
 	f.mutex.Lock()
+	if f.classed {
+		f.fileStream(id, str)
+		f.mutex.Unlock()
+		return
+	}
 	if _, ok := f.activeStreams[id]; !ok {
 		f.streamQueue.PushBack(id)
 		f.activeStreams[id] = str
@@ -308,6 +323,7 @@ func (f *framer) AddStreamWithControlFrames(id protocol.StreamID, str streamCont
 func (f *framer) RemoveActiveStream(id protocol.StreamID) {
 	f.mutex.Lock()
 	delete(f.activeStreams, id)
+	delete(f.ringOf, id)
 	// We don't delete the stream from the streamQueue,
 	// since we'd have to iterate over the ringbuffer.
 	// Instead, we check if the stream is still in activeStreams when appending STREAM frames.
@@ -349,6 +365,10 @@ func (f *framer) Handle0RTTRejection() {
 	for id := range f.activeStreams {
 		delete(f.activeStreams, id)
 	}
+	for i := range f.classRings {
+		f.classRings[i].Clear()
+	}
+	clear(f.ringOf)
 	clear(f.streamsWithControlFrames)
 	var j int
 	for i, frame := range f.controlFrames {

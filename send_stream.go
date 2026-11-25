@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/apernet/quic-go/congestion"
 	"github.com/apernet/quic-go/internal/ackhandler"
 	"github.com/apernet/quic-go/internal/monotime"
 	"github.com/apernet/quic-go/internal/protocol"
@@ -50,6 +51,15 @@ type SendStream struct {
 	nextFrame *wire.StreamFrame
 	// set if flow control credit for nextFrame was already consumed
 	nextFrameReserved bool
+
+	// Class scheduling (send_stream_class.go). classTagged is set once the
+	// stream is written with a class or boosted; until then it keeps no
+	// class state. classLimit caps the data length of the next new-data
+	// frame while a classed pop is in progress; it is zero otherwise.
+	classSegs   []classSeg
+	classTagged bool
+	boost       bool
+	classLimit  protocol.ByteCount
 
 	supportsResetStreamAt bool
 	finishedWriting       bool // set once Close() is called
@@ -121,7 +131,7 @@ func (s *SendStream) WriteWithLimit(p []byte, limiter func(maxBytes int) int) (i
 	s.writeOnce <- struct{}{}
 	defer func() { <-s.writeOnce }()
 
-	isNewlyCompleted, n, err := s.write(p, limiter)
+	isNewlyCompleted, n, err := s.writeClassed(p, limiter, congestion.ClassBulk, false)
 	if isNewlyCompleted {
 		s.sender.onStreamCompleted(s.streamID)
 	}
@@ -169,6 +179,9 @@ func (s *SendStream) tryWriteAll(p []byte) (bool /* is newly completed */, bool 
 	}
 
 	bytesToReserve := protocol.ByteCount(len(p))
+	if s.classTagged {
+		defer s.recordWriteClass(congestion.ClassBulk, s.heldEnd())
+	}
 	if s.nextFrame != nil && !s.nextFrameReserved {
 		bytesToReserve += s.nextFrame.DataLen()
 	}
@@ -204,13 +217,20 @@ func (s *SendStream) tryWriteAll(p []byte) (bool /* is newly completed */, bool 
 	return false, true, nil
 }
 
-func (s *SendStream) write(p []byte, limiter func(int) int) (bool /* is newly completed */, int, error) {
+// writeClassed is the body of every blocking write. classed says the caller
+// named a class; a stream that is not classed and not boosted records none.
+func (s *SendStream) writeClassed(p []byte, limiter func(int) int, class congestion.SendClass, classed bool) (bool /* is newly completed */, int, error) {
 	s.mutex.Lock()
 	s.writeLimiter = limiter
 	s.writeLimited = false
 	defer func() {
 		s.writeLimiter = nil
 		s.writeLimited = false
+		if s.classTagged {
+			// A write that returned short leaves no class behind for the
+			// bytes it never handed over.
+			s.trimClassSegs(s.heldEnd())
+		}
 		s.mutex.Unlock()
 	}()
 
@@ -231,6 +251,10 @@ func (s *SendStream) write(p []byte, limiter func(int) int) (bool /* is newly co
 		return false, 0, nil
 	}
 
+	if classed || s.classTagged {
+		s.classTagged = true
+		s.recordWriteClass(class, s.heldEnd())
+	}
 	s.dataForWriting = p
 
 	var (
@@ -425,6 +449,10 @@ func (s *SendStream) popNewOrRetransmittedStreamFrame(maxBytes protocol.ByteCoun
 	if s.resetErr != nil && reliableOffset > 0 {
 		maxDataLen = min(maxDataLen, reliableOffset-s.writeOffset)
 	}
+	if s.classLimit > 0 {
+		// A classed pop: the frame ends where the class it is served at does.
+		maxDataLen = min(maxDataLen, s.classLimit)
+	}
 	if s.nextFrame != nil {
 		maxDataLen = min(maxDataLen, s.nextFrame.MaxDataLen(maxBytes, v), s.nextFrame.DataLen())
 	} else {
@@ -560,6 +588,7 @@ func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCou
 				DataLenPresent: true,
 				Fin:            f.Fin,
 				Data:           append([]byte(nil), f.Data[start-f.Offset:]...),
+				Class:          f.Class,
 			}
 			f.Data = f.Data[:start-f.Offset]
 			f.Fin = false
@@ -609,6 +638,10 @@ func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCou
 func (s *SendStream) hasSendableData(connWindow bool) bool {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+	return s.hasSendableDataLocked(connWindow)
+}
+
+func (s *SendStream) hasSendableDataLocked(connWindow bool) bool {
 	if s.shutdownErr != nil {
 		return false
 	}

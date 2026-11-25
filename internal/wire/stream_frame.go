@@ -16,6 +16,12 @@ type StreamFrame struct {
 	Fin            bool
 	DataLenPresent bool
 
+	// Class is local bookkeeping for class scheduling: the send class the
+	// frame's bytes were charged to when it was first sent (a congestion
+	// SendClass), or zero when the stream is not classed. It is not part of
+	// the wire image.
+	Class uint8
+
 	fromPool bool
 }
 
@@ -173,6 +179,7 @@ func (f *StreamFrame) MaybeSplitOffFrame(maxSize protocol.ByteCount, version pro
 	new.Offset = f.Offset
 	new.Fin = false
 	new.DataLenPresent = f.DataLenPresent
+	new.Class = f.Class
 
 	// swap the data slices
 	new.Data, f.Data = f.Data, new.Data

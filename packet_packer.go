@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 
+	"github.com/apernet/quic-go/congestion"
 	"github.com/apernet/quic-go/internal/ackhandler"
 	"github.com/apernet/quic-go/internal/handshake"
 	"github.com/apernet/quic-go/internal/monotime"
@@ -150,6 +151,11 @@ type packetPacker struct {
 	// chaosProtection applies Chrome's chaos protection to Initial packets.
 	// See appendChaosProtectedPayload.
 	chaosProtection bool
+
+	// classPermit, if set, returns the permit the next 1-RTT packet is built
+	// under when the connection's PathSender schedules classes. See
+	// packet_packer_class.go.
+	classPermit func() (congestion.Permit, bool)
 }
 
 const DatagramFrameMaxPeekTimes = 10
@@ -591,7 +597,13 @@ func (p *packetPacker) appendPacket(
 	pn, pnLen := p.pnManager.PeekPacketNumber(protocol.Encryption1RTT)
 	connID := p.getDestConnID()
 	hdrLen := wire.ShortHeaderLen(connID, pnLen)
-	pl := p.maybeGetShortHeaderPacket(sealer, hdrLen, maxPacketSize, onlyAck, now, v)
+	var pl payload
+	if permit, ok := p.currentClassPermit(onlyAck); ok {
+		maxPacketSize = min(maxPacketSize, protocol.ByteCount(permit.MaxBytes))
+		pl = p.maybeGetClassedPacket(maxPacketSize-hdrLen-protocol.ByteCount(sealer.Overhead()), permit, now, v)
+	} else {
+		pl = p.maybeGetShortHeaderPacket(sealer, hdrLen, maxPacketSize, onlyAck, now, v)
+	}
 	if pl.length == 0 {
 		return shortHeaderPacket{}, errNothingToPack
 	}

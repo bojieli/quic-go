@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/apernet/quic-go/congestion"
 	"github.com/apernet/quic-go/internal/ackhandler"
 	"github.com/apernet/quic-go/internal/monotime"
 	"github.com/apernet/quic-go/internal/protocol"
@@ -136,6 +137,18 @@ func (s *Stream) Write(p []byte) (int, error) {
 // See [SendStream.WriteWithLimit] for more details.
 func (s *Stream) WriteWithLimit(p []byte, limiter func(maxBytes int) int) (int, error) {
 	return s.sendStr.WriteWithLimit(p, limiter)
+}
+
+// WriteClass writes data to the stream and records its send class.
+// See [SendStream.WriteClass] for more details.
+func (s *Stream) WriteClass(p []byte, class congestion.SendClass) (int, error) {
+	return s.sendStr.WriteClass(p, class)
+}
+
+// SetBoost sets the stream's boost property.
+// See [SendStream.SetBoost] for more details.
+func (s *Stream) SetBoost(on bool) {
+	s.sendStr.SetBoost(on)
 }
 
 // TryWriteAll writes data to the stream if it can be queued immediately.

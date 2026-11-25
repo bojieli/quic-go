@@ -124,10 +124,10 @@ type Demand struct{ Eligible [NumSendClasses]bool }
 // Permit is the answer to Admit. A permit reserves nothing: it is a value
 // owned by one build operation, and all state changes at OnSent.
 //
-// The packet builder does not yet honour Turn, Fill or MaxBytes: it fills a
-// permitted packet as it would any other, up to the connection's packet size.
-// A PathSender must therefore admit whole packets of any class. Building
-// under the permit's class and limits is a later change.
+// The packet builder executes Turn, Fill and MaxBytes only for a PathSender
+// that is a ClassScheduler. For any other PathSender it fills a permitted
+// packet as it would any other, up to the connection's packet size, so such a
+// PathSender must admit whole packets of any class.
 type Permit struct {
 	OK   bool
 	Turn SendClass
@@ -138,6 +138,29 @@ type Permit struct {
 	// RetryAt is when a refusal for pacing or precedence may clear. It is zero
 	// when the refusal is window-limited.
 	RetryAt monotime.Time
+}
+
+// ClassScheduler is a PathSender that arbitrates between send classes and
+// whose permits the packet builder executes. When SchedulesClasses reports
+// true at installation, every packet built under a permit:
+//
+//   - is at most MaxBytes long;
+//   - carries bytes of class Turn first, then, in the order CONTROL,
+//     INTERACTIVE, BULK, bytes of each other class up to its Fill allowance,
+//     and otherwise goes out short;
+//   - carries exempt obligations (an ACK, PATH_RESPONSE, a liveness PING)
+//     whatever its turn.
+//
+// Stream bytes are classed by SendStream.WriteClass and SetBoost, DATAGRAM
+// frames are INTERACTIVE, and control frames, their retransmissions, window
+// updates and post-handshake crypto data are CONTROL. Demand is reported per
+// class, and SentPacket.ClassBytes reports the bytes actually built by class,
+// with the packet overhead charged to the turn. A datagram that does not fit
+// a class's allowance stays queued. PTO probes and MTU probes are built
+// without regard to the turn; an MTU probe's bytes are INTERACTIVE.
+type ClassScheduler interface {
+	PathSender
+	SchedulesClasses() bool
 }
 
 // SentPacket describes a packet as it was actually built and registered.

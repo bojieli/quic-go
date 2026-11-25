@@ -231,18 +231,27 @@ type Conn struct {
 	// callbacks switch together.
 	pathSenderMx      sync.Mutex
 	pendingController congestion.CongestionControl
+	// pendingEpoch is the controller epoch of pendingController.
+	pendingEpoch      uint64
 	hasPendingInstall atomic.Bool
 	hasPathSender     atomic.Bool
-	hasPendingGrant   atomic.Bool
 	pathSender        congestion.PathSender
 	demand            congestion.Demand
+	// classed says the installed PathSender schedules classes
+	// (congestion.ClassScheduler). Run loop only.
+	classed bool
 
 	datagramObserver atomic.Pointer[func(tag uint64, outcome DatagramOutcome)]
 
-	// pendingGrant is a verification grant waiting to be bound on the run
-	// loop (under pathSenderMx); grant is the bound one, run loop only.
-	pendingGrant *boundGrant
-	grant        *boundGrant
+	// grant is the bound verification grant. Binding takes effect at once:
+	// the exempt builder reads it, takes the granted bytes and charges them
+	// under grantMx, so no bytes are taken under a grant after another has
+	// been bound. grantEpoch counts controller installation requests; a
+	// grant is stamped with the epoch it was bound in, and installing a
+	// controller clears a grant bound before that controller was requested.
+	grantMx    sync.Mutex
+	grant      *boundGrant
+	grantEpoch uint64
 
 	datagramQueue *datagramQueue
 
@@ -398,7 +407,9 @@ var newConnection = func(
 		s.version,
 	)
 	s.cryptoStreamHandler = cs
-	s.packer = newPacketPacker(srcConnID, s.connIDManager.Get, s.initialStream, s.handshakeStream, s.sentPacketHandler, s.retransmissionQueue, cs, s.framer, &s.receivedPacketHandler, s.datagramQueue, s.perspective, false)
+	packer := newPacketPacker(srcConnID, s.connIDManager.Get, s.initialStream, s.handshakeStream, s.sentPacketHandler, s.retransmissionQueue, cs, s.framer, &s.receivedPacketHandler, s.datagramQueue, s.perspective, false)
+	packer.classPermit = s.currentClassPermit
+	s.packer = packer
 	s.unpacker = newPacketUnpacker(cs, s.srcConnIDLen)
 	s.cryptoStreamManager = newCryptoStreamManager(s.initialStream, s.handshakeStream, s.oneRTTStream)
 	return &wrappedConn{Conn: s}
@@ -535,7 +546,9 @@ var newClientConnection = func(
 	s.cryptoStreamHandler = cs
 	s.cryptoStreamManager = newCryptoStreamManager(s.initialStream, s.handshakeStream, oneRTTStream)
 	s.unpacker = newPacketUnpacker(cs, s.srcConnIDLen)
-	s.packer = newPacketPacker(srcConnID, s.connIDManager.Get, s.initialStream, s.handshakeStream, s.sentPacketHandler, s.retransmissionQueue, cs, s.framer, &s.receivedPacketHandler, s.datagramQueue, s.perspective, s.config.ChromeParrot)
+	packer := newPacketPacker(srcConnID, s.connIDManager.Get, s.initialStream, s.handshakeStream, s.sentPacketHandler, s.retransmissionQueue, cs, s.framer, &s.receivedPacketHandler, s.datagramQueue, s.perspective, s.config.ChromeParrot)
+	packer.classPermit = s.currentClassPermit
+	s.packer = packer
 	if len(tlsConf.ServerName) > 0 {
 		s.tokenStoreKey = tlsConf.ServerName
 	} else {
@@ -990,12 +1003,6 @@ func (c *Conn) applyPendingSettings(now monotime.Time) {
 		c.keepAliveFloor = floor
 		c.keepAliveStep = 0
 	}
-	if c.hasPendingGrant.Load() {
-		c.pathSenderMx.Lock()
-		c.grant, c.pendingGrant = c.pendingGrant, nil
-		c.hasPendingGrant.Store(false)
-		c.pathSenderMx.Unlock()
-	}
 	if !c.hasPendingInstall.Load() {
 		return
 	}
@@ -1005,6 +1012,7 @@ func (c *Conn) applyPendingSettings(now monotime.Time) {
 	// SetCongestionControl themselves.
 	c.pathSenderMx.Lock()
 	cc := c.pendingController
+	epoch := c.pendingEpoch
 	c.pendingController = nil
 	if cc == nil {
 		c.hasPendingInstall.Store(false)
@@ -1012,6 +1020,9 @@ func (c *Conn) applyPendingSettings(now monotime.Time) {
 		return
 	}
 	c.pathSenderMx.Unlock()
+	// A grant bound for the controller being replaced covers nothing for
+	// this one.
+	c.clearGrantsBefore(epoch)
 	ps, isPathSender := cc.(congestion.PathSender)
 	if isPathSender {
 		c.sentPacketHandler.InstallPathSender(ps, now, c.scheduleSending)
@@ -1021,6 +1032,7 @@ func (c *Conn) applyPendingSettings(now monotime.Time) {
 		c.sentPacketHandler.SetCongestionControl(cc)
 		c.pathSender = nil
 	}
+	c.setClassed(isPathSender && ackhandler.SchedulesClasses(ps))
 	c.pathSenderMx.Lock()
 	c.hasPathSender.Store(isPathSender)
 	if c.pendingController == nil {
@@ -2738,40 +2750,61 @@ func (c *Conn) maybeSendExemptPacket(now monotime.Time) error {
 	ecn := c.sentPacketHandler.ECNMode(true)
 	maxSize := c.maxPacketSize()
 	var granted func(protocol.ByteCount, protocol.Version) ackhandler.StreamFrame
-	var grantedFrame bool
-	if g := c.grant; g != nil {
-		if !now.Before(g.grant.Expiry) || g.remaining <= 0 {
-			// Expired or spent: it covers nothing any more.
-			c.grant = nil
-		} else {
-			granted = func(maxLen protocol.ByteCount, v protocol.Version) ackhandler.StreamFrame {
-				// Whatever the packet already holds -- header, AEAD tag, ACK,
-				// exempt frames -- is charged to the grant too.
-				committed := maxSize - maxLen
-				if protocol.ByteCount(g.remaining) <= committed {
-					return ackhandler.StreamFrame{}
-				}
-				maxLen = min(maxLen, protocol.ByteCount(g.remaining)-committed)
-				sf, blocked := g.str.popGrantedStreamFrame(maxLen, protocol.ByteCount(g.grant.Start), protocol.ByteCount(g.grant.End), v)
-				if blocked != nil {
-					// Ordinary control work, not covered by the grant.
-					c.framer.QueueControlFrame(blocked)
-				}
-				grantedFrame = sf.Frame != nil
-				return sf
+	// usedGrant is the grant the packet's granted bytes were taken under:
+	// the one bound at that moment, read under grantMx.
+	var usedGrant *boundGrant
+	var charged congestion.ByteCount
+	if c.hasGrant(now) {
+		granted = func(maxLen protocol.ByteCount, v protocol.Version) ackhandler.StreamFrame {
+			c.grantMx.Lock()
+			defer c.grantMx.Unlock()
+			g := c.grant
+			if g == nil || !now.Before(g.grant.Expiry) || g.remaining <= 0 {
+				return ackhandler.StreamFrame{}
 			}
+			// Whatever the packet already holds -- header, AEAD tag, ACK,
+			// exempt frames -- is charged to the grant too.
+			committed := maxSize - maxLen
+			if protocol.ByteCount(g.remaining) <= committed {
+				return ackhandler.StreamFrame{}
+			}
+			maxLen = min(maxLen, protocol.ByteCount(g.remaining)-committed)
+			sf, blocked := g.str.popGrantedStreamFrame(maxLen, protocol.ByteCount(g.grant.Start), protocol.ByteCount(g.grant.End), v)
+			if blocked != nil {
+				// Ordinary control work, not covered by the grant.
+				c.framer.QueueControlFrame(blocked)
+			}
+			if sf.Frame != nil {
+				usedGrant = g
+				// Charge the packet as it stands, so the budget is spent
+				// before the lock is released; corrected to its final
+				// length below.
+				charged = congestion.ByteCount(committed + sf.Frame.Length(v))
+				g.remaining -= charged
+			}
+			return sf
 		}
 	}
 	p, buf, err := c.packer.PackExemptPacket(maxSize, now, granted, c.version)
+	if usedGrant != nil {
+		c.grantMx.Lock()
+		usedGrant.remaining += charged
+		if err == nil {
+			usedGrant.remaining -= congestion.ByteCount(p.Length)
+		}
+		c.grantMx.Unlock()
+	}
 	if err != nil {
 		if err == errNothingToPack {
+			// The build may have used up the last eligible work without a
+			// packet: a grant at its write limit.
+			c.refreshDemandAfterEmptyBuild()
 			return nil
 		}
 		return err
 	}
-	if grantedFrame {
-		c.grant.remaining -= congestion.ByteCount(p.Length)
-		c.sentPacketHandler.ExpectGrantedPacket(c.grant.grant.ID)
+	if usedGrant != nil {
+		c.sentPacketHandler.ExpectGrantedPacket(usedGrant.grant.ID)
 		// The exchange may need more packets.
 		c.scheduleSending()
 	}
@@ -2794,7 +2827,7 @@ func (c *Conn) exemptPassAfterRefusal() {
 	if c.pathSender == nil || !c.sentPacketHandler.AdmissionRefused() {
 		return
 	}
-	if c.grant != nil || c.framer.HasExemptData() {
+	if c.hasGrant(monotime.Now()) || c.framer.HasExemptData() {
 		c.scheduleSending()
 	}
 }
@@ -2804,6 +2837,30 @@ type boundGrant struct {
 	grant     congestion.VerificationGrant
 	str       *SendStream
 	remaining congestion.ByteCount
+	// epoch is the controller epoch the grant was bound in.
+	epoch uint64
+}
+
+// hasGrant says whether a live grant is bound, and forgets one that expired
+// or is spent.
+func (c *Conn) hasGrant(now monotime.Time) bool {
+	c.grantMx.Lock()
+	defer c.grantMx.Unlock()
+	if g := c.grant; g != nil && (!now.Before(g.grant.Expiry) || g.remaining <= 0) {
+		// Expired or spent: it covers nothing any more.
+		c.grant = nil
+	}
+	return c.grant != nil
+}
+
+// clearGrantsBefore forgets a grant bound before the controller of the given
+// epoch was requested.
+func (c *Conn) clearGrantsBefore(epoch uint64) {
+	c.grantMx.Lock()
+	if c.grant != nil && c.grant.epoch < epoch {
+		c.grant = nil
+	}
+	c.grantMx.Unlock()
 }
 
 // GrantableStream is a stream a verification grant can be bound to: a
@@ -2816,8 +2873,13 @@ type GrantableStream interface{ grantSendStream() *SendStream }
 // connection's PathSender refuses admission, the connection may build packets
 // that carry those bytes (and their retransmissions) and the exempt
 // obligations, and nothing else; each is reported to the PathSender with the
-// grant's ID. Binding another grant replaces this one. It has no effect
-// without a PathSender, and changes nothing on the wire.
+// grant's ID. Binding another grant replaces this one at once: once
+// BindVerificationGrant returns, no bytes are taken under the earlier grant,
+// so a packet reported with its ID afterwards can only be one whose bytes
+// were taken, and charged, while it was the bound grant. Installing another
+// controller (SetCongestionControl) clears a grant bound before it was
+// requested. It has no effect without a PathSender, and changes nothing on
+// the wire.
 func (c *Conn) BindVerificationGrant(str GrantableStream, g congestion.VerificationGrant) error {
 	if g.ID == 0 || g.Start < 0 || g.End <= g.Start || g.End > congestion.ByteCount(protocol.MaxByteCount) || g.Budget <= 0 {
 		return errors.New("invalid verification grant")
@@ -2837,21 +2899,21 @@ func (c *Conn) BindVerificationGrant(str GrantableStream, g congestion.Verificat
 	if owner != streamSender(c) {
 		return errors.New("verification grant bound to another connection's stream")
 	}
-	c.pathSenderMx.Lock()
-	c.pendingGrant = &boundGrant{grant: g, str: s, remaining: g.Budget}
-	c.hasPendingGrant.Store(true)
-	c.pathSenderMx.Unlock()
+	c.grantMx.Lock()
+	c.grant = &boundGrant{grant: g, str: s, remaining: g.Budget, epoch: c.grantEpoch}
+	c.grantMx.Unlock()
 	c.scheduleSending()
 	return nil
 }
 
 // updateDemand reports the connection's eligible demand to its PathSender
-// when it changed. The query consumes nothing. Without class tags, stream data
-// is BULK, datagrams INTERACTIVE, and control frames, retransmissions, due
-// window updates and post-handshake crypto data CONTROL. Stream data counts
-// only while the connection-level send window is open; stream-level flow
-// control is not consulted.
-func (c *Conn) updateDemand() {
+// when it changed, and says whether it did. The query consumes nothing.
+// Datagrams are INTERACTIVE, and control frames, retransmissions, due window
+// updates and post-handshake crypto data CONTROL. Without class scheduling
+// stream data is BULK; with it, a stream's data is of its effective class.
+// New stream data counts only while both the connection's and the stream's
+// send windows are open.
+func (c *Conn) updateDemand() bool {
 	var d congestion.Demand
 	d.Eligible[congestion.ClassExempt] = c.framer.HasExemptData() || c.receivedPacketHandler.HasAckDue(monotime.Now())
 	if !d.Eligible[congestion.ClassExempt] && c.perspective == protocol.PerspectiveClient && c.handshakeConfirmed {
@@ -2873,11 +2935,71 @@ func (c *Conn) updateDemand() {
 	d.Eligible[congestion.ClassInteractive] = c.datagramQueue != nil && c.datagramQueue.Peek() != nil
 	// A stream is eligible if it could send a frame now: retransmissions,
 	// reserved bytes and FIN need no credit, new bytes need both windows.
-	d.Eligible[congestion.ClassBulk] = c.framer.HasStreamData(c.connFlowController.SendWindowSize() > 0)
+	if c.classed {
+		streams := c.framer.StreamDemand(c.connFlowController.SendWindowSize() > 0)
+		for _, class := range classOrder {
+			d.Eligible[class] = d.Eligible[class] || streams[class]
+		}
+	} else {
+		d.Eligible[congestion.ClassBulk] = c.framer.HasStreamData(c.connFlowController.SendWindowSize() > 0)
+	}
 	if d != c.demand {
 		c.demand = d
 		c.pathSender.OnDemand(d)
+		return true
 	}
+	return false
+}
+
+// refreshDemandAfterEmptyBuild is called when a build produced no packet. It
+// may still have used up the last eligible work -- an oversized DATAGRAM
+// discarded, a stream whose write limit returned zero -- so demand is
+// refreshed, and if it changed while work remains the connection tries again
+// at once: the PathSender may now give the turn to a class that has work.
+func (c *Conn) refreshDemandAfterEmptyBuild() {
+	if c.pathSender == nil {
+		return
+	}
+	if c.updateDemand() && c.hasOrdinaryDemand() {
+		c.scheduleSending()
+	}
+}
+
+// hasOrdinaryDemand says whether the last demand reported has work that needs
+// a permit.
+func (c *Conn) hasOrdinaryDemand() bool {
+	for _, class := range classOrder {
+		if c.demand.Eligible[class] {
+			return true
+		}
+	}
+	return false
+}
+
+// setClassed switches the connection's builder between class-scheduled
+// packets and the ordinary builder. Run loop only.
+func (c *Conn) setClassed(on bool) {
+	if c.classed == on {
+		return
+	}
+	c.classed = on
+	c.framer.SetClassed(on)
+	c.demand = congestion.Demand{}
+}
+
+// currentClassPermit is the packer's view of the permit the next packet is
+// built under, while the PathSender schedules classes.
+func (c *Conn) currentClassPermit() (congestion.Permit, bool) {
+	if !c.classed {
+		return congestion.Permit{}, false
+	}
+	ph, ok := c.sentPacketHandler.(interface {
+		Permit() (congestion.Permit, bool)
+	})
+	if !ok {
+		return congestion.Permit{}, false
+	}
+	return ph.Permit()
 }
 
 func (c *Conn) sendPackets(now monotime.Time) error {
@@ -2947,6 +3069,7 @@ func (c *Conn) sendPacketsWithoutGSO(now monotime.Time) error {
 		if _, err := c.appendOneShortHeaderPacket(buf, c.maxPacketSize(), ecn, now); err != nil {
 			if err == errNothingToPack {
 				buf.Release()
+				c.refreshDemandAfterEmptyBuild()
 				return nil
 			}
 			return err
@@ -2993,6 +3116,7 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 			if err != errNothingToPack {
 				return err
 			}
+			c.refreshDemandAfterEmptyBuild()
 			if buf.Len() == 0 {
 				buf.Release()
 				return nil
@@ -3627,14 +3751,20 @@ func estimateMaxPayloadSize(mtu protocol.ByteCount) protocol.ByteCount {
 // PathSender, which is also done on the run loop.
 func (c *Conn) SetCongestionControl(cc congestion.CongestionControl) {
 	c.pathSenderMx.Lock()
+	c.grantMx.Lock()
+	c.grantEpoch++
+	epoch := c.grantEpoch
+	c.grantMx.Unlock()
 	_, isPathSender := cc.(congestion.PathSender)
 	if isPathSender || c.hasPathSender.Load() || c.hasPendingInstall.Load() {
 		c.pendingController = cc
+		c.pendingEpoch = epoch
 		c.hasPendingInstall.Store(true)
 		c.pathSenderMx.Unlock()
 		c.scheduleSending()
 		return
 	}
+	c.clearGrantsBefore(epoch)
 	c.sentPacketHandler.SetCongestionControl(cc)
 	c.pathSenderMx.Unlock()
 }
