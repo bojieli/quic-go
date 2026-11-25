@@ -252,6 +252,10 @@ type Conn struct {
 	grantMx    sync.Mutex
 	grant      *boundGrant
 	grantEpoch uint64
+	// installedEpoch is the epoch of the controller installed now. A grant
+	// bound for a controller still waiting to be installed is kept, but
+	// covers nothing until it is.
+	installedEpoch uint64
 
 	datagramQueue *datagramQueue
 
@@ -2766,7 +2770,9 @@ func (c *Conn) maybeSendExemptPacket(now monotime.Time) error {
 		granted = func(maxLen protocol.ByteCount, v protocol.Version) ackhandler.StreamFrame {
 			c.grantMx.Lock()
 			defer c.grantMx.Unlock()
-			g := c.grant
+			// A grant bound for a controller not yet installed is not spent
+			// under, or reported to, the one that is.
+			g := c.usableGrant()
 			if g == nil || !now.Before(g.grant.Expiry) || g.remaining <= 0 {
 				return ackhandler.StreamFrame{}
 			}
@@ -2862,17 +2868,27 @@ func (c *Conn) hasGrant(now monotime.Time) bool {
 		// Expired or spent: it covers nothing any more.
 		c.grant = nil
 	}
-	return c.grant != nil
+	return c.usableGrant() != nil
 }
 
-// clearGrantsBefore forgets a grant bound before the controller of the given
-// epoch was requested.
+// clearGrantsBefore records that the controller of the given epoch is being
+// installed, and forgets a grant bound before it was requested.
 func (c *Conn) clearGrantsBefore(epoch uint64) {
 	c.grantMx.Lock()
+	c.installedEpoch = max(c.installedEpoch, epoch)
 	if c.grant != nil && c.grant.epoch < epoch {
 		c.grant = nil
 	}
 	c.grantMx.Unlock()
+}
+
+// usableGrant is the bound grant if the controller it was bound for is the
+// one installed. It must be called with grantMx held.
+func (c *Conn) usableGrant() *boundGrant {
+	if g := c.grant; g != nil && g.epoch <= c.installedEpoch {
+		return g
+	}
+	return nil
 }
 
 // GrantableStream is a stream a verification grant can be bound to: a

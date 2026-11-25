@@ -182,14 +182,16 @@ func (s *SendStream) tryWriteAll(p []byte) (bool /* is newly completed */, bool 
 	}
 
 	bytesToReserve := protocol.ByteCount(len(p))
-	if s.classTagged {
-		defer s.recordWriteClass(congestion.ClassBulk, s.heldEnd())
-	}
+	start := s.heldEnd()
 	if s.nextFrame != nil && !s.nextFrameReserved {
 		bytesToReserve += s.nextFrame.DataLen()
 	}
 	if !s.flowController.TryAddBytesSent(bytesToReserve) {
 		return false, false, ErrWouldBlock
+	}
+	if s.classTagged {
+		// Only bytes actually accepted get a class.
+		s.recordWriteClass(congestion.ClassBulk, start)
 	}
 
 	if s.nextFrame == nil {
@@ -911,10 +913,16 @@ func (s *SendStream) CancelWrite(errorCode StreamErrorCode) {
 			s.recountRetx()
 		}
 	}
+	// What survives below a reliable boundary may now be of another class
+	// than the stream was filed as.
+	refile := s.classTagged && s.holdsData()
 	s.mutex.Unlock()
 
 	s.signalWrite()
 	s.sender.onHasStreamControlFrame(s.streamID, s)
+	if refile {
+		s.sender.onHasStreamData(s.streamID, s)
+	}
 }
 
 func (s *SendStream) enableResetStreamAt() {

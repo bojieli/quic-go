@@ -559,3 +559,21 @@ func TestExemptOnlyClassBuildChargesOverheadToTheTurn(t *testing.T) {
 	require.Equal(t, congestion.ByteCount(pr.Length(protocol.Version1)), got[congestion.ClassExempt])
 	require.Equal(t, congestion.ByteCount(40)-got[congestion.ClassExempt], got[congestion.ClassBulk])
 }
+
+// An EXEMPT turn with fill charges its overhead to EXEMPT, not to the fill
+// class, which was admitted only up to its allowance.
+func TestExemptTurnKeepsOverheadOutOfTheFill(t *testing.T) {
+	rec := newRecordingPathSender()
+	sph := NewSentPacketHandler(0, 1200, utils.NewRTTStats(), &utils.ConnectionStats{}, true, false, nil, protocol.PerspectiveClient, false, nil, utils.DefaultLogger).(*sentPacketHandler)
+	sph.InstallPathSender(classedRecordingPathSender{rec}, monotime.Now(), func() {})
+	rec.admit = congestion.Permit{OK: true, Turn: congestion.ClassExempt, MaxBytes: 1200,
+		Fill: [congestion.NumSendClasses]congestion.ByteCount{congestion.ClassBulk: 500}}
+	require.Equal(t, SendAny, sph.SendMode(monotime.Now()))
+	bulk := &wire.StreamFrame{StreamID: 4, Data: make([]byte, 100), Class: uint8(congestion.ClassBulk)}
+	pn := sph.PopPacketNumber(protocol.Encryption1RTT)
+	sph.ExpectClassBuilt()
+	sph.SentPacket(monotime.Now(), pn, protocol.InvalidPacketNumber, []StreamFrame{{Frame: bulk}}, nil, protocol.Encryption1RTT, protocol.ECNNon, 150, false, false)
+	got := rec.sent[len(rec.sent)-1].ClassBytes
+	require.Equal(t, congestion.ByteCount(bulk.Length(protocol.Version1)), got[congestion.ClassBulk])
+	require.Equal(t, 150-got[congestion.ClassBulk], got[congestion.ClassExempt])
+}

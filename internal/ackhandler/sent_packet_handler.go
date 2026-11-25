@@ -1797,7 +1797,7 @@ func (h *sentPacketHandler) sentPacketInfo(t monotime.Time, encLevel protocol.En
 	if framed < p.Length {
 		overhead := congestionExt.ByteCount(p.Length - framed)
 		class := congestionExt.ClassExempt
-		if turn := h.permit.Turn; h.classed && classBuilt && !exempt && h.permit.OK && turn != congestionExt.ClassExempt && turn < congestionExt.NumSendClasses {
+		if turn := h.permit.Turn; h.classed && classBuilt && !exempt && h.permit.OK && turn < congestionExt.NumSendClasses {
 			// A class-built packet's overhead is its turn's, even when only
 			// fill classes, or only exempt frames, found room in it.
 			class = turn

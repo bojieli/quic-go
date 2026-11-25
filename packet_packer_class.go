@@ -119,7 +119,7 @@ func (p *packetPacker) composeClassedPacket(maxPayloadSize, fullPayload protocol
 		case congestion.ClassControl:
 			if hasRetransmission {
 				for {
-					f := p.retransmissionQueue.GetFrame(protocol.Encryption1RTT, limit-used, v)
+					f := p.retransmissionQueue.GetFittingFrame(limit-used, v)
 					if f == nil {
 						break
 					}

@@ -5,6 +5,7 @@ import (
 	"sync"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"github.com/apernet/quic-go/congestion"
 	"github.com/apernet/quic-go/internal/ackhandler"
@@ -144,4 +145,17 @@ func testDemandRefreshedAfterEmptyBuild(t *testing.T, gso, exempt bool) {
 		synctest.Wait()
 		require.NoError(t, <-errChan)
 	})
+}
+
+// A grant bound for a controller that has been requested but not yet
+// installed covers nothing until it is: the controller installed now never
+// has packets charged to a grant meant for its successor.
+func TestGrantForAPendingControllerWaitsForItsInstallation(t *testing.T) {
+	c := &Conn{}
+	c.grant = &boundGrant{grant: congestion.VerificationGrant{ID: 1, Expiry: monotime.Now().Add(time.Hour)}, remaining: 1000, epoch: 2}
+	c.installedEpoch = 1
+	require.False(t, c.hasGrant(monotime.Now()), "a grant for the pending controller was usable under the installed one")
+	require.NotNil(t, c.grant, "it is kept, not dropped")
+	c.clearGrantsBefore(2) // the controller of epoch 2 is installed
+	require.True(t, c.hasGrant(monotime.Now()))
 }

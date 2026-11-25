@@ -251,3 +251,40 @@ func TestTimedOutClassedWriteRefilesAPendingRetransmission(t *testing.T) {
 	_, sfs, _ = h.framer.AppendClass(nil, nil, congestion.ClassBulk, 1200, true, monotime.Now(), protocol.Version1)
 	require.Len(t, sfs, 1, "the retransmission is stranded in the CONTROL ring")
 }
+
+// A failed TryWriteAll accepts nothing and records no class: the stream's
+// FIN stays at the class of its last accepted bytes.
+func TestFailedTryWriteAllRecordsNoClass(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	sender := NewMockStreamSender(mockCtrl)
+	str := newSendStream(context.Background(), 40, sender, newTestStreamFlowControllerWithSendWindow(40, 100), false)
+	sender.EXPECT().onHasStreamData(gomock.Any(), gomock.Any()).AnyTimes()
+	writeClassBuffered(t, str, 100, congestion.ClassInteractive)
+	_, _, _ = popClassed(t, str, 1200)
+	require.ErrorIs(t, str.TryWriteAll(make([]byte, 10)), ErrWouldBlock)
+	require.NoError(t, str.Close())
+	require.Equal(t, congestion.ClassInteractive, str.streamClass())
+}
+
+// CancelWrite with a reliable boundary re-files what survives: a BULK
+// retransmission below it is found on a BULK turn once the CONTROL one
+// beyond it is dropped.
+func TestCancelWriteRefilesTheReliablePrefix(t *testing.T) {
+	h := newBuilderHarness(true)
+	str := h.stream(44)
+	str.enableResetStreamAt()
+	writeClassBuffered(t, str, 100, congestion.ClassBulk)
+	_, bulk, _ := h.framer.AppendClass(nil, nil, congestion.ClassBulk, 1200, true, monotime.Now(), protocol.Version1)
+	require.Len(t, bulk, 1)   // [0, 100) at BULK
+	str.SetReliableBoundary() // at 100
+	writeClassBuffered(t, str, 100, congestion.ClassControl)
+	_, control, _ := h.framer.AppendClass(nil, nil, congestion.ClassControl, 1200, true, monotime.Now(), protocol.Version1)
+	require.Len(t, control, 1) // [100, 200) at CONTROL
+	bulk[0].Handler.OnLost(bulk[0].Frame)
+	control[0].Handler.OnLost(control[0].Frame)
+	require.Equal(t, congestion.ClassControl, str.streamClass())
+	str.CancelWrite(1)
+	require.Equal(t, congestion.ClassBulk, str.streamClass())
+	_, sfs, _ := h.framer.AppendClass(nil, nil, congestion.ClassBulk, 1200, true, monotime.Now(), protocol.Version1)
+	require.Len(t, sfs, 1, "the reliable prefix is stranded in the CONTROL ring")
+}

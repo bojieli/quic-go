@@ -582,3 +582,16 @@ func TestClassedBuilderNeverDropsACrowdedDatagram(t *testing.T) {
 	pl := h.packer.composeClassedPacket(testPayload, testPayload, permit, true, monotime.Now(), protocol.Version1)
 	require.IsType(t, &wire.DatagramFrame{}, pl.frames[0].Frame)
 }
+
+// A lost control frame too large for a small CONTROL allowance stays queued
+// and does not hold up a smaller one behind it.
+func TestClassedControlRetransmissionsSkipWhatDoesNotFit(t *testing.T) {
+	h := newBuilderHarness(true)
+	h.packer.retransmissionQueue.addAppData(&wire.NewConnectionIDFrame{SequenceNumber: 1, ConnectionID: protocol.ParseConnectionID(make([]byte, 20))})
+	h.packer.retransmissionQueue.addAppData(&wire.MaxDataFrame{MaximumData: 1 << 20})
+	pl := h.packer.composeClassedPacket(testPayload, testPayload, congestion.Permit{OK: true, Turn: congestion.ClassBulk, MaxBytes: 1252,
+		Fill: [congestion.NumSendClasses]congestion.ByteCount{congestion.ClassControl: 20}}, true, monotime.Now(), protocol.Version1)
+	require.Len(t, pl.frames, 1)
+	require.IsType(t, &wire.MaxDataFrame{}, pl.frames[0].Frame)
+	require.True(t, h.packer.retransmissionQueue.HasData(protocol.Encryption1RTT), "the larger frame stays queued")
+}
