@@ -250,15 +250,16 @@ func TestMTUProbeNeedsAPermitThatCoversIt(t *testing.T) {
 // asked to admit, up to limit when one is set, and refuses a larger request.
 type exactGrantScheduler struct {
 	demandRecorder
-	limit congestion.ByteCount
-	asked []congestion.ByteCount
+	limit   congestion.ByteCount
+	retryAt monotime.Time // when set, a request over limit is a pacing refusal
+	asked   []congestion.ByteCount
 }
 
 func (s *exactGrantScheduler) SchedulesClasses() bool { return true }
 func (s *exactGrantScheduler) Admit(_ monotime.Time, maxBytes congestion.ByteCount) congestion.Permit {
 	s.asked = append(s.asked, maxBytes)
 	if s.limit > 0 && maxBytes > s.limit {
-		return congestion.Permit{} // a window refusal
+		return congestion.Permit{RetryAt: s.retryAt} // a window refusal, or a pacing one with retryAt
 	}
 	return congestion.Permit{OK: true, Turn: congestion.ClassBulk, MaxBytes: maxBytes}
 }
@@ -288,7 +289,9 @@ func TestMTUProbeIsAdmittedAtItsOwnSize(t *testing.T) {
 	now := monotime.Now()
 	probe := congestion.ByteCount(mtu.NextProbeSize())
 
-	require.Equal(t, ackhandler.SendAny, conn.admitFirstPacket(now))
+	mode, retry := conn.admitFirstPacket(now)
+	require.Equal(t, ackhandler.SendAny, mode)
+	require.Zero(t, retry)
 	require.Equal(t, []congestion.ByteCount{probe}, ps.asked)
 	require.True(t, conn.permitCoversMTUProbe(), "the permit covers the probe")
 	require.True(t, mtu.ShouldSendProbe(now), "asking for admission does not put the probe in flight")
@@ -299,20 +302,36 @@ func TestMTUProbeIsAdmittedAtItsOwnSize(t *testing.T) {
 
 	// No probe due: ordinary admissions.
 	_, _ = mtu.GetPing(now)
-	require.Equal(t, ackhandler.SendAny, conn.admitFirstPacket(now))
+	mode, _ = conn.admitFirstPacket(now)
+	require.Equal(t, ackhandler.SendAny, mode)
 	require.Equal(t, congestion.ByteCount(1200), ps.asked[2])
 }
 
 // A scheduler that refuses the probe's size but would admit an ordinary
 // packet is asked again at the ordinary size, so a due probe never holds up
-// ordinary traffic. The probe stays due.
+// ordinary traffic. The probe stays due, and a pass that ends with it still
+// due wakes when the scheduler said the probe's refusal may clear.
 func TestRefusedMTUProbeFallsBackToOrdinaryAdmission(t *testing.T) {
-	ps := &exactGrantScheduler{limit: 1200}
-	conn, mtu, _ := newMTUProbeConn(t, ps)
-	now := monotime.Now()
-	probe := congestion.ByteCount(mtu.NextProbeSize())
-	require.Equal(t, ackhandler.SendAny, conn.admitFirstPacket(now))
-	require.Equal(t, []congestion.ByteCount{probe, 1200}, ps.asked)
-	require.False(t, conn.permitCoversMTUProbe(), "the ordinary permit does not carry the probe")
-	require.True(t, mtu.ShouldSendProbe(now), "the probe stays due")
+	for _, pacing := range []bool{false, true} {
+		ps := &exactGrantScheduler{limit: 1200}
+		conn, mtu, _ := newMTUProbeConn(t, ps)
+		now := monotime.Now()
+		if pacing {
+			ps.retryAt = now.Add(10 * time.Millisecond)
+		}
+		probe := congestion.ByteCount(mtu.NextProbeSize())
+		mode, retry := conn.admitFirstPacket(now)
+		require.Equal(t, ackhandler.SendAny, mode)
+		require.Equal(t, []congestion.ByteCount{probe, 1200}, ps.asked)
+		require.False(t, conn.permitCoversMTUProbe(), "the ordinary permit does not carry the probe")
+		require.True(t, mtu.ShouldSendProbe(now), "the probe stays due")
+		require.Equal(t, ps.retryAt, retry, "pacing refusal: %v", pacing)
+		if pacing {
+			conn.armMTUProbeRetry(now, retry)
+			require.Equal(t, ps.retryAt, conn.pacingDeadline, "the probe's retry time survives the ordinary admission")
+			conn.pacingDeadline = deadlineSendImmediately
+			conn.armMTUProbeRetry(now, retry)
+			require.Equal(t, deadlineSendImmediately, conn.pacingDeadline, "an earlier wake is kept")
+		}
+	}
 }

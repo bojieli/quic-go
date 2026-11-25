@@ -2696,7 +2696,10 @@ func (c *Conn) triggerSending(now monotime.Time) error {
 		c.updateDemand()
 	}
 
-	sendMode := c.admitFirstPacket(now)
+	sendMode, probeRetry := c.admitFirstPacket(now)
+	if !probeRetry.IsZero() {
+		defer c.armMTUProbeRetry(now, probeRetry)
+	}
 	switch sendMode {
 	case ackhandler.SendAny:
 		return c.sendPackets(now)
@@ -3057,16 +3060,32 @@ func (c *Conn) setClassed(on bool) {
 // fits. The probe is not taken from the discoverer, so not in flight, until a
 // permit covers it. A scheduler may refuse the probe's size and still admit
 // an ordinary packet, so a refusal is followed by an ordinary admission, and
-// the probe stays due.
-func (c *Conn) admitFirstPacket(now monotime.Time) ackhandler.SendMode {
+// the probe stays due. probeRetry is when the scheduler said the probe's
+// refusal may clear, or zero.
+func (c *Conn) admitFirstPacket(now monotime.Time) (_ ackhandler.SendMode, probeRetry monotime.Time) {
 	if !c.requestMTUProbeAdmission(now) {
-		return c.sentPacketHandler.SendMode(now)
+		return c.sentPacketHandler.SendMode(now), 0
 	}
 	mode := c.sentPacketHandler.SendMode(now)
 	if mode == ackhandler.SendAny || !c.sentPacketHandler.AdmissionRefused() {
-		return mode
+		return mode, 0
 	}
-	return c.sentPacketHandler.SendMode(now)
+	if mode == ackhandler.SendPacingLimited {
+		probeRetry = c.sentPacketHandler.TimeUntilSend()
+	}
+	return c.sentPacketHandler.SendMode(now), probeRetry
+}
+
+// armMTUProbeRetry makes sure the connection wakes when a refused MTU probe
+// may be admitted, if the probe is still due when the send pass ends: the
+// ordinary admission that followed the refusal replaced its retry time.
+func (c *Conn) armMTUProbeRetry(now, at monotime.Time) {
+	if !c.mtuDiscoverer.ShouldSendProbe(now) {
+		return
+	}
+	if c.pacingDeadline.IsZero() || at.Before(c.pacingDeadline) {
+		c.pacingDeadline = at
+	}
 }
 
 // requestMTUProbeAdmission asks the next admission to cover the MTU probe

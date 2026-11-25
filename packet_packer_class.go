@@ -185,11 +185,12 @@ func (p *packetPacker) permitHasWork(permit congestion.Permit, hasRetransmission
 		// Only a datagram the packet has room for beside the ACK that
 		// would be taken for it, within its fill allowance.
 		if d := p.datagramQueue.Peek(); d != nil {
-			budget := maxPayloadSize - p.ackFrameLength(now, maxPayloadSize, v)
+			budget := maxPayloadSize
 			if permit.Turn != congestion.ClassInteractive {
 				budget = min(budget, protocol.ByteCount(permit.Fill[congestion.ClassInteractive]))
 			}
-			if d.Length(v) <= budget {
+			// The ACK is only measured for a datagram that fits otherwise.
+			if l := d.Length(v); l <= budget && l <= maxPayloadSize-p.ackFrameLength(now, maxPayloadSize, v) {
 				return true
 			}
 		}
