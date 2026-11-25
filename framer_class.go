@@ -14,6 +14,13 @@ import (
 // takes at least this.
 const minStreamFrameLen protocol.ByteCount = 3
 
+// smallClassBudget and smallBudgetTries bound the work of offering a class
+// budget too small for most streams' frames.
+const (
+	smallClassBudget protocol.ByteCount = 32
+	smallBudgetTries                    = 4
+)
+
 // ringEntry is a stream filed in a class ring. Only the entry whose
 // generation is the stream's current one is live; re-filing a stream makes a
 // new entry and leaves the old one to be skipped, so a stream that moves away
@@ -132,6 +139,22 @@ func (f *framer) fileStream(id protocol.StreamID, str streamFrameGetter) {
 		return
 	}
 	f.file(id, class)
+}
+
+// HasSendableClassedData says whether the framer has work a packet could
+// carry now: control or exempt frames, or a stream that could send. Unlike
+// HasData it does not count a stream that is filed but has nothing to send,
+// so it does not make a packet take an ACK before it is due.
+func (f *framer) HasSendableClassedData() bool {
+	if f.HasControlData() || f.HasExemptData() {
+		return true
+	}
+	for _, d := range f.StreamDemand(f.connFlowController.SendWindowSize() > 0) {
+		if d {
+			return true
+		}
+	}
+	return false
 }
 
 // hasClassedStreams says whether any class ring holds a live stream. It must be
@@ -363,7 +386,14 @@ func (f *framer) appendClassStreams(
 	ring := &f.classRings[class]
 	f.serving = true
 	defer func() { f.serving = false }()
-	for range ring.Len() {
+	tries := ring.Len()
+	if maxLen < smallClassBudget {
+		// A budget this small may fit no stream's frame. Offer it to a few
+		// streams, in turn, rather than walk the whole ring every packet;
+		// the round-robin order still moves on.
+		tries = min(tries, smallBudgetTries)
+	}
+	for range tries {
 		remaining := maxLen - length
 		if remaining < minStreamFrameLen {
 			// The stream's own frame sizing decides what fits a small

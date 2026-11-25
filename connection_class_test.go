@@ -159,3 +159,71 @@ func TestGrantForAPendingControllerWaitsForItsInstallation(t *testing.T) {
 	c.clearGrantsBefore(2) // the controller of epoch 2 is installed
 	require.True(t, c.hasGrant(monotime.Now()))
 }
+
+// permittingHandler adds the permit accessor to the mock handler.
+type permittingHandler struct {
+	*mockackhandler.MockSentPacketHandler
+	permit congestion.Permit
+}
+
+func (h permittingHandler) Permit() (congestion.Permit, bool) { return h.permit, true }
+
+// emptyBuildRecorder is a demand recorder that is also told of empty builds.
+type emptyBuildRecorder struct {
+	demandRecorder
+	empty []congestion.Permit
+}
+
+func (r *emptyBuildRecorder) OnEmptyBuild(_ monotime.Time, p congestion.Permit) {
+	r.mu.Lock()
+	r.empty = append(r.empty, p)
+	r.mu.Unlock()
+}
+
+// When an admitted class-built pass builds nothing and demand is unchanged
+// -- the work does not fit the permit -- the scheduler is told, so it can
+// decide differently; the connection does not spin on the same permit.
+func TestEmptyAdmittedBuildIsReportedToTheScheduler(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		mockCtrl := gomock.NewController(t)
+		sph := mockackhandler.NewMockSentPacketHandler(mockCtrl)
+		permit := congestion.Permit{OK: true, Turn: congestion.ClassInteractive, MaxBytes: 300}
+		tc := newServerTestConnection(t, mockCtrl,
+			&Config{DisablePathMTUDiscovery: true, EnableDatagrams: true}, false,
+			connectionOptHandshakeConfirmed(),
+			connectionOptSentPacketHandler(permittingHandler{sph, permit}),
+		)
+		rec := &emptyBuildRecorder{}
+		tc.conn.pathSender = rec
+		tc.conn.hasPathSender.Store(true)
+		tc.conn.classed = true
+		sph.EXPECT().GetLossDetectionTimeout().AnyTimes()
+		sph.EXPECT().ECNMode(gomock.Any()).Return(protocol.ECNNon).AnyTimes()
+		sph.EXPECT().TimeUntilSend().AnyTimes()
+		sph.EXPECT().DetachPathSender(gomock.Any()).AnyTimes()
+		sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendAny).AnyTimes()
+		var builds int
+		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+			func(*packetBuffer, protocol.ByteCount, monotime.Time, protocol.Version) (shortHeaderPacket, error) {
+				builds++ // the datagram does not fit 300 bytes: nothing is built
+				return shortHeaderPacket{}, errNothingToPack
+			}).AnyTimes()
+		require.NoError(t, tc.conn.datagramQueue.Add(&wire.DatagramFrame{Data: make([]byte, 900)}))
+
+		errChan := make(chan error, 1)
+		go func() { errChan <- tc.conn.run() }()
+		tc.conn.scheduleSending()
+		synctest.Wait()
+
+		rec.mu.Lock()
+		empty := append([]congestion.Permit(nil), rec.empty...)
+		rec.mu.Unlock()
+		require.Equal(t, []congestion.Permit{permit}, empty)
+		require.Equal(t, 1, builds, "the connection retried the same permit")
+
+		tc.connRunner.EXPECT().Remove(gomock.Any()).AnyTimes()
+		tc.conn.destroy(nil)
+		synctest.Wait()
+		require.NoError(t, <-errChan)
+	})
+}

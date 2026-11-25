@@ -173,6 +173,17 @@ type ClassScheduler interface {
 	SchedulesClasses() bool
 }
 
+// EmptyBuildObserver is a ClassScheduler that wants to know when a packet
+// admitted under one of its permits could not be built, although the
+// connection still reports demand and the demand did not change -- the work
+// the turn was given to does not fit the permit (a datagram larger than a
+// short MaxBytes, say). It is called on the connection's run loop with that
+// permit. The connection does not retry by itself; the scheduler may change
+// its decision and call the wake function it got at OnAttach.
+type EmptyBuildObserver interface {
+	OnEmptyBuild(now monotime.Time, p Permit)
+}
+
 // MinClassedPermit is the smallest packet a class-scheduled permit may
 // allow: room for the header, the AEAD tag, a truncated ACK frame and some
 // class work, whatever the connection ID and packet number lengths.

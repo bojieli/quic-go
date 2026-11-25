@@ -615,3 +615,53 @@ func TestClassedControlRetransmissionsDrainInOrder(t *testing.T) {
 		require.Equal(t, protocol.StreamNum(i+1), n)
 	}
 }
+
+type recordingAcks struct{ onlyIfQueued []bool }
+
+func (r *recordingAcks) GetAckFrame(_ protocol.EncryptionLevel, _ monotime.Time, onlyIfQueued bool) *wire.AckFrame {
+	r.onlyIfQueued = append(r.onlyIfQueued, onlyIfQueued)
+	return nil
+}
+
+// A stream left filed after its last retransmission has nothing to send, so
+// it does not make a packet take an ACK before the ACK is due.
+func TestClassedBuilderDoesNotTakeAnEarlyAckForAnIdleFiledStream(t *testing.T) {
+	h := newBuilderHarness(true)
+	acks := &recordingAcks{}
+	h.packer.acks = acks
+	str := h.stream(4)
+	writeClassBuffered(t, str, 100, congestion.ClassBulk)
+	_, sfs, _ := h.framer.AppendClass(nil, nil, congestion.ClassBulk, 1200, true, monotime.Now(), protocol.Version1)
+	sfs[0].Handler.OnLost(sfs[0].Frame)
+	_, sfs, _ = h.framer.AppendClass(nil, nil, congestion.ClassBulk, 1200, true, monotime.Now(), protocol.Version1)
+	require.Len(t, sfs, 1) // the retransmission; the stream stays filed
+	require.True(t, h.framer.HasData(), "setup: the stream is still filed")
+	h.packer.composeClassedPacket(testPayload, testPayload, congestion.Permit{OK: true, Turn: congestion.ClassControl, MaxBytes: 1252}, true, monotime.Now(), protocol.Version1)
+	require.Equal(t, []bool{true}, acks.onlyIfQueued, "an ACK was taken before it was due")
+}
+
+type countingClassedStream struct {
+	fakeClassedStream
+	pops *int
+}
+
+func (s *countingClassedStream) popClassedStreamFrame(maxBytes protocol.ByteCount, want congestion.SendClass, v protocol.Version) (ackhandler.StreamFrame, *wire.StreamDataBlockedFrame, bool, congestion.SendClass, congestion.SendClass) {
+	*s.pops++
+	return ackhandler.StreamFrame{}, nil, true, s.class, s.class // nothing fits
+}
+
+// A budget too small for most frames is offered to a few streams, not to the
+// whole ring, on every packet.
+func TestClassedFramerBoundsTheScanForATinyBudget(t *testing.T) {
+	h := newBuilderHarness(true)
+	var pops int
+	for i := range 100 {
+		s := &countingClassedStream{fakeClassedStream: fakeClassedStream{id: protocol.StreamID(4 * (i + 1)), class: congestion.ClassBulk}, pops: &pops}
+		h.framer.AddActiveStream(s.id, s)
+	}
+	h.framer.AppendClass(nil, nil, congestion.ClassBulk, 8, false, monotime.Now(), protocol.Version1)
+	require.LessOrEqual(t, pops, smallBudgetTries)
+	pops = 0
+	h.framer.AppendClass(nil, nil, congestion.ClassBulk, 1200, false, monotime.Now(), protocol.Version1)
+	require.Equal(t, 100, pops, "a normal budget still offers every stream its turn")
+}

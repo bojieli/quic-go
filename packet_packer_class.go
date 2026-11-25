@@ -74,7 +74,12 @@ func (p *packetPacker) maybeGetClassedPacket(maxPayloadSize, fullPayload protoco
 
 func (p *packetPacker) composeClassedPacket(maxPayloadSize, fullPayload protocol.ByteCount, permit congestion.Permit, ackAllowed bool, now monotime.Time, v protocol.Version) payload {
 	cf := p.framer.(classedFrameSource)
+	// Whether anything could ride with an ACK that is not yet due: sendable
+	// work, not ring membership.
 	hasData := p.framer.HasData()
+	if s, ok := p.framer.(interface{ HasSendableClassedData() bool }); ok {
+		hasData = s.HasSendableClassedData()
+	}
 	hasRetransmission := p.retransmissionQueue.HasData(protocol.Encryption1RTT)
 
 	var pl payload

@@ -2992,6 +2992,18 @@ func (c *Conn) refreshDemandAfterEmptyBuild() {
 	}
 	if c.updateDemand() && c.hasOrdinaryDemand() {
 		c.scheduleSending()
+		return
+	}
+	// Demand is unchanged: the admitted work did not fit the permit. The
+	// scheduler is told, so it can decide differently, rather than the
+	// connection retrying the same permit.
+	if !c.hasOrdinaryDemand() {
+		return
+	}
+	if permit, ok := c.currentClassPermit(); ok && permit.OK {
+		if o, ok := c.pathSender.(congestion.EmptyBuildObserver); ok {
+			o.OnEmptyBuild(monotime.Now(), permit)
+		}
 	}
 }
 
