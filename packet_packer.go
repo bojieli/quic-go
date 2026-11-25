@@ -156,6 +156,9 @@ type packetPacker struct {
 	// under when the connection's PathSender schedules classes. See
 	// packet_packer_class.go.
 	classPermit func() (congestion.Permit, bool)
+	// classBuilt says the last packet appendPacket built executed its
+	// permit's class decision.
+	classBuilt bool
 }
 
 const DatagramFrameMaxPeekTimes = 10
@@ -598,7 +601,9 @@ func (p *packetPacker) appendPacket(
 	connID := p.getDestConnID()
 	hdrLen := wire.ShortHeaderLen(connID, pnLen)
 	var pl payload
-	if permit, ok := p.currentClassPermit(onlyAck); ok {
+	permit, classed := p.currentClassPermit(onlyAck)
+	p.classBuilt = classed
+	if classed {
 		fullPayload := maxPacketSize - hdrLen - protocol.ByteCount(sealer.Overhead())
 		maxPacketSize = min(maxPacketSize, protocol.ByteCount(permit.MaxBytes))
 		pl = p.maybeGetClassedPacket(maxPacketSize-hdrLen-protocol.ByteCount(sealer.Overhead()), fullPayload, permit, true, now, v)

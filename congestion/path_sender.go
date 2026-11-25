@@ -159,6 +159,12 @@ type Permit struct {
 // a class's allowance stays queued. PTO probes and MTU probes are built
 // without regard to the turn; an MTU probe's bytes are INTERACTIVE.
 //
+// Permits are executed from handshake confirmation on. Before it, packets
+// are coalesced with Initial and Handshake packets whose CRYPTO data and
+// padding the handshake dictates; a permit then admits the packet, but the
+// builder fills it as for any other PathSender, and SentPacket.ClassBuilt
+// is false. ClassBytes still reports what it carried by class.
+//
 // A permit's MaxBytes must be at least MinClassedPermit. A smaller permit
 // is treated as a window refusal: the connection sends only its exempt
 // obligations, due ACKs among them, until a usable permit comes.
@@ -192,6 +198,11 @@ type SentPacket struct {
 	// Grant is the ID of the verification grant the packet was built under,
 	// or zero.
 	Grant uint64
+	// ClassBuilt says the builder executed the permit's Turn, Fill and
+	// MaxBytes (ClassScheduler). A packet built under a permit without it
+	// -- before handshake confirmation, or a PTO probe -- was admitted by
+	// the permit but filled as for any PathSender.
+	ClassBuilt bool
 }
 
 // PacketRef names one packet.

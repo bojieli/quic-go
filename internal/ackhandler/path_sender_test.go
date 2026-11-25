@@ -494,7 +494,11 @@ func TestClassedPacketBytesAreReportedByServedClass(t *testing.T) {
 		require.Equal(t, SendAny, sph.SendMode(monotime.Now()))
 		control := &wire.StreamFrame{StreamID: 4, Data: make([]byte, 100), Class: uint8(congestion.ClassControl)}
 		pn := sph.PopPacketNumber(protocol.Encryption1RTT)
+		if classed {
+			sph.ExpectClassBuilt()
+		}
 		sph.SentPacket(monotime.Now(), pn, protocol.InvalidPacketNumber, []StreamFrame{{Frame: control}}, nil, protocol.Encryption1RTT, protocol.ECNNon, 150, false, false)
+		require.Equal(t, classed, rec.sent[len(rec.sent)-1].ClassBuilt)
 		got := rec.sent[len(rec.sent)-1].ClassBytes
 		frame := congestion.ByteCount(control.Length(protocol.Version1))
 		if classed {
@@ -518,4 +522,23 @@ func TestClassedPermitBelowTheMinimumIsARefusal(t *testing.T) {
 	require.True(t, sph.AdmissionRefused())
 	rec.admit.MaxBytes = congestion.MinClassedPermit
 	require.Equal(t, SendAny, sph.SendMode(monotime.Now()))
+}
+
+// A packet admitted by a class permit but not built executing it -- before
+// handshake confirmation -- says so, and its overhead is not charged to a
+// turn it did not take.
+func TestPermitWithoutClassBuildIsReported(t *testing.T) {
+	rec := newRecordingPathSender()
+	sph := NewSentPacketHandler(0, 1200, utils.NewRTTStats(), &utils.ConnectionStats{}, true, false, nil, protocol.PerspectiveClient, false, nil, utils.DefaultLogger).(*sentPacketHandler)
+	sph.InstallPathSender(classedRecordingPathSender{rec}, monotime.Now(), func() {})
+	rec.admit = congestion.Permit{OK: true, Turn: congestion.ClassInteractive, MaxBytes: 1200}
+	require.Equal(t, SendAny, sph.SendMode(monotime.Now()))
+	bulk := &wire.StreamFrame{StreamID: 4, Data: make([]byte, 100), Class: uint8(congestion.ClassBulk)}
+	pn := sph.PopPacketNumber(protocol.Encryption1RTT)
+	sph.SentPacket(monotime.Now(), pn, protocol.InvalidPacketNumber, []StreamFrame{{Frame: bulk}}, nil, protocol.Encryption1RTT, protocol.ECNNon, 150, false, false)
+	p := rec.sent[len(rec.sent)-1]
+	require.False(t, p.ClassBuilt)
+	require.False(t, p.Exempt)
+	require.Equal(t, congestion.ByteCount(150), p.ClassBytes[congestion.ClassBulk])
+	require.Zero(t, p.ClassBytes[congestion.ClassInteractive])
 }

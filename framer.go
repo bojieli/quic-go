@@ -270,7 +270,7 @@ func (f *framer) appendOrdinaryControlFrames(
 	now monotime.Time,
 	v protocol.Version,
 ) ([]ackhandler.Frame, protocol.ByteCount) {
-	frames, length = f.appendStreamControlFrames(frames, length, maxLen, now, v)
+	frames, length = f.appendStreamControlFramesBelow(frames, length, maxLen, maxStreamControlFrameSize, now, v)
 	for len(f.controlFrames) > 0 {
 		frame := f.controlFrames[len(f.controlFrames)-1]
 		frameLen := frame.Length(v)
@@ -284,11 +284,13 @@ func (f *framer) appendOrdinaryControlFrames(
 	return frames, length
 }
 
-// appendStreamControlFrames appends the streams' control frames.
-func (f *framer) appendStreamControlFrames(
+// appendStreamControlFramesBelow appends the streams' control frames while
+// more than maxFrame bytes are left.
+func (f *framer) appendStreamControlFramesBelow(
 	frames []ackhandler.Frame,
 	length protocol.ByteCount,
 	maxLen protocol.ByteCount,
+	maxFrame protocol.ByteCount,
 	now monotime.Time,
 	v protocol.Version,
 ) ([]ackhandler.Frame, protocol.ByteCount) {
@@ -296,7 +298,7 @@ func (f *framer) appendStreamControlFrames(
 	for id, str := range f.streamsWithControlFrames {
 	start:
 		remainingLen := maxLen - length
-		if remainingLen <= maxStreamControlFrameSize {
+		if remainingLen <= maxFrame {
 			break
 		}
 		fr, ok, hasMore := str.getControlFrame(now)

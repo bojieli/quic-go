@@ -226,12 +226,19 @@ func (s *SendStream) writeClassed(p []byte, limiter func(int) int, class congest
 	defer func() {
 		s.writeLimiter = nil
 		s.writeLimited = false
+		var refile bool
 		if s.classTagged {
 			// A write that returned short leaves no class behind for the
-			// bytes it never handed over.
+			// bytes it never handed over. If that changes the class the
+			// stream is served at, it is re-filed.
+			before := s.effectiveClass()
 			s.trimClassSegs(s.heldEnd())
+			refile = s.effectiveClass() != before && s.holdsData()
 		}
 		s.mutex.Unlock()
+		if refile {
+			s.sender.onHasStreamData(s.streamID, s)
+		}
 	}()
 
 	if s.resetErr != nil {
@@ -581,6 +588,16 @@ func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCou
 		header := (&wire.StreamFrame{StreamID: s.streamID, Offset: offset, DataLenPresent: true}).Length(v) - 1 // without the length field
 		return min(maxBytes, header+protocol.ByteCount(quicvarint.Len(uint64(n)))+n)
 	}
+	// On a class-scheduled connection a retransmission is charged to the
+	// class the stream is served at, a boost included, as on the ordinary
+	// classed path.
+	served := s.effectiveClass()
+	stampRetx := func(f *wire.StreamFrame) *wire.StreamFrame {
+		if classed && s.classTagged {
+			f.Class = uint8(served)
+		}
+		return f
+	}
 	for i, f := range s.retransmissionQueue {
 		if f.DataLen() == 0 || f.Offset >= end || f.Offset+f.DataLen() <= start {
 			// A FIN-only frame carries no granted byte.
@@ -609,11 +626,11 @@ func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCou
 				return ackhandler.StreamFrame{}, nil
 			}
 			s.numOutstandingFrames++
-			return ackhandler.StreamFrame{Frame: newFrame, Handler: (*sendStreamAckHandler)(s)}, nil
+			return ackhandler.StreamFrame{Frame: stampRetx(newFrame), Handler: (*sendStreamAckHandler)(s)}, nil
 		}
 		s.retransmissionQueue = slices.Delete(s.retransmissionQueue, i, i+1)
 		s.numOutstandingFrames++
-		return ackhandler.StreamFrame{Frame: f, Handler: (*sendStreamAckHandler)(s)}, nil
+		return ackhandler.StreamFrame{Frame: stampRetx(f), Handler: (*sendStreamAckHandler)(s)}, nil
 	}
 	if s.writeOffset < start || s.writeOffset >= end {
 		return ackhandler.StreamFrame{}, nil

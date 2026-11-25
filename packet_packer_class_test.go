@@ -449,3 +449,23 @@ func TestClassedControlPassSplitsCryptoAndSkipsWhatDoesNotFit(t *testing.T) {
 	require.Equal(t, protocol.ByteCount(900), crypto)
 	require.False(t, h.framer.HasControlData())
 }
+
+// Draining a control backlog under a small allowance keeps the queue in
+// order and does not rebuild it per pass.
+func TestClassedControlPassKeepsTheBacklogInOrder(t *testing.T) {
+	h := newBuilderHarness(true)
+	for i := range 50 {
+		h.framer.QueueControlFrame(&wire.MaxStreamsFrame{MaxStreamNum: protocol.StreamNum(i + 1)})
+	}
+	var got []protocol.StreamNum
+	for range 100 {
+		frames, _, _ := h.framer.AppendClass(nil, nil, congestion.ClassControl, 6, false, monotime.Now(), protocol.Version1)
+		for _, f := range frames {
+			got = append(got, f.Frame.(*wire.MaxStreamsFrame).MaxStreamNum)
+		}
+	}
+	require.Len(t, got, 50)
+	for i, n := range got {
+		require.Equal(t, protocol.StreamNum(50-i), n, "popped from the end, as the ordinary builder does")
+	}
+}

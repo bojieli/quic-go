@@ -229,31 +229,45 @@ func (f *framer) AppendClass(
 // CRYPTO frame is split to the space left. It must be called with
 // controlFrameMutex held.
 func (f *framer) appendClassedControlFrames(frames []ackhandler.Frame, maxLen protocol.ByteCount, now monotime.Time, v protocol.Version) ([]ackhandler.Frame, protocol.ByteCount) {
-	frames, length := f.appendStreamControlFrames(frames, 0, maxLen, now, v)
-	kept := f.controlFrames[:0:0]
-	for i := len(f.controlFrames) - 1; i >= 0; i-- {
-		frame := f.controlFrames[i]
+	// RESET_STREAM_AT, the largest stream control frame, is 33 bytes.
+	frames, length := f.appendStreamControlFramesBelow(frames, 0, maxLen, maxStreamControlFrameSizeAt, now, v)
+	// The queue is popped from its end. Frames are taken from the end down
+	// to the first index examined; those kept are compacted in place over
+	// the examined range, in their order, and the unexamined front stays
+	// as it is, so a pass costs what it looks at.
+	q := f.controlFrames
+	w := len(q) // the retained frames are written down from the end
+	i := len(q) - 1
+	for ; i >= 0; i-- {
 		room := maxLen - length
+		if room <= 0 {
+			break
+		}
+		frame := q[i]
 		if l := frame.Length(v); l <= room {
 			frames = append(frames, ackhandler.Frame{Frame: frame})
 			length += l
 			continue
 		}
-		if cf, ok := frame.(*wire.CryptoFrame); ok && room > 0 {
+		if cf, ok := frame.(*wire.CryptoFrame); ok {
 			if head, split := cf.MaybeSplitOffFrame(room, v); split && head != nil {
 				frames = append(frames, ackhandler.Frame{Frame: head})
 				length += head.Length(v)
 			}
 		}
-		kept = append(kept, frame)
+		w--
+		q[w] = frame
 	}
-	// kept is in pop order; the queue is popped from its end.
-	for l, r := 0, len(kept)-1; l < r; l, r = l+1, r-1 {
-		kept[l], kept[r] = kept[r], kept[l]
-	}
-	f.controlFrames = kept
+	// q[:i+1] was not examined; q[w:] holds the retained frames in order.
+	n := copy(q[i+1:], q[w:])
+	clear(q[i+1+n:])
+	f.controlFrames = q[:i+1+n]
 	return frames, length
 }
+
+// maxStreamControlFrameSizeAt is the largest stream control frame,
+// RESET_STREAM_AT with four eight-byte varints.
+const maxStreamControlFrameSizeAt = 33
 
 // RefileStream re-files an active stream whose effective class may have
 // changed outside the framer's own pops (a verification grant's build path).

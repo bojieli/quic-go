@@ -119,6 +119,9 @@ type sentPacketHandler struct {
 	// grantPending is the verification grant the next packet was built
 	// under, or zero.
 	grantPending uint64
+	// classBuiltPending says the next packet was built executing its
+	// permit's class decision.
+	classBuiltPending bool
 	// ackLenPending is the size of the next packet's ACK frame.
 	ackLenPending protocol.ByteCount
 	// discardRefs is scratch space for OnDiscarded.
@@ -390,7 +393,7 @@ func (h *sentPacketHandler) SentPacket(
 		pnSpace.history.SentPathProbePacket(pn, p)
 		if ps != nil {
 			h.ackLenPending = 0
-			ps.OnSent(h.sentPacketInfo(t, encLevel, pn, p, congestionExt.KindPathProbe, true, 0))
+			ps.OnSent(h.sentPacketInfo(t, encLevel, pn, p, congestionExt.KindPathProbe, true, 0, false))
 		}
 		h.setLossDetectionTimer(t)
 		return
@@ -418,8 +421,11 @@ func (h *sentPacketHandler) SentPacket(
 		}
 		ackLen := h.ackLenPending
 		h.ackLenPending = 0
-		info := h.sentPacketInfo(t, encLevel, pn, p, kind, !underPermit, ackLen)
+		classBuilt := h.classBuiltPending
+		h.classBuiltPending = false
+		info := h.sentPacketInfo(t, encLevel, pn, p, kind, !underPermit, ackLen, classBuilt)
 		info.Grant = grant
+		info.ClassBuilt = classBuilt && underPermit
 		ps.OnSent(info)
 	} else {
 		cc.OnPacketSent(t, h.bytesInFlight, pn, size, isAckEliciting)
@@ -1651,6 +1657,10 @@ func (h *sentPacketHandler) Permit() (congestionExt.Permit, bool) {
 	return h.permit, h.classed && h.pathSender != nil
 }
 
+// ExpectClassBuilt says the next packet was built executing its permit's
+// class decision.
+func (h *sentPacketHandler) ExpectClassBuilt() { h.classBuiltPending = true }
+
 // ExpectGrantedPacket says the next packet was built under a verification
 // grant.
 func (h *sentPacketHandler) ExpectGrantedPacket(id uint64) { h.grantPending = id }
@@ -1737,7 +1747,7 @@ func (h *sentPacketHandler) packetKind(encLevel protocol.EncryptionLevel, p *pac
 // classed by frame type: stream data is BULK, DATAGRAM frames INTERACTIVE,
 // ACK, PING and path validation EXEMPT, anything else CONTROL. Packet
 // overhead is charged to the first non-exempt class the packet carries.
-func (h *sentPacketHandler) sentPacketInfo(t monotime.Time, encLevel protocol.EncryptionLevel, pn protocol.PacketNumber, p *packet, kind congestionExt.PacketKind, exempt bool, ackLen protocol.ByteCount) congestionExt.SentPacket {
+func (h *sentPacketHandler) sentPacketInfo(t monotime.Time, encLevel protocol.EncryptionLevel, pn protocol.PacketNumber, p *packet, kind congestionExt.PacketKind, exempt bool, ackLen protocol.ByteCount, classBuilt bool) congestionExt.SentPacket {
 	info := congestionExt.SentPacket{
 		Space:           spaceOf(encLevel),
 		Number:          congestionExt.PacketNumber(pn),
@@ -1786,7 +1796,7 @@ func (h *sentPacketHandler) sentPacketInfo(t monotime.Time, encLevel protocol.En
 		overhead := congestionExt.ByteCount(p.Length - framed)
 		class := congestionExt.ClassExempt
 		carriesWork := info.ClassBytes[congestionExt.ClassControl]+info.ClassBytes[congestionExt.ClassInteractive]+info.ClassBytes[congestionExt.ClassBulk] > 0
-		if turn := h.permit.Turn; h.classed && !exempt && h.permit.OK && turn != congestionExt.ClassExempt && turn < congestionExt.NumSendClasses && carriesWork {
+		if turn := h.permit.Turn; h.classed && classBuilt && !exempt && h.permit.OK && turn != congestionExt.ClassExempt && turn < congestionExt.NumSendClasses && carriesWork {
 			// A class-scheduled packet's overhead is its turn's, even when
 			// only fill classes found room in it.
 			class = turn

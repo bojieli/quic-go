@@ -3,6 +3,7 @@ package quic
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/apernet/quic-go/congestion"
 	"github.com/apernet/quic-go/internal/ackhandler"
@@ -136,4 +137,35 @@ func TestGrantedFramesCarryTheirClass(t *testing.T) {
 	require.Equal(t, uint8(congestion.ClassInteractive), f.Frame.Class)
 	f.Handler.OnLost(f.Frame)
 	require.Equal(t, congestion.ClassInteractive, str.streamClass())
+}
+
+// A classed write that times out before any of its bytes are accepted leaves
+// the stream served at the class of what it still holds, and re-files it.
+func TestShortClassedWriteRestoresTheStreamsClass(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	fc := newTestStreamFlowControllerWithSendWindow(1<<20, protocol.MaxByteCount)
+	sender := NewMockStreamSender(mockCtrl)
+	str := newSendStream(context.Background(), 20, sender, fc, false)
+	var notified int
+	sender.EXPECT().onHasStreamData(protocol.StreamID(20), str).Do(func(protocol.StreamID, *SendStream) { notified++ }).AnyTimes()
+	writeClassBuffered(t, str, 1000, congestion.ClassBulk) // buffered tail
+	require.NoError(t, str.SetWriteDeadline(time.Now().Add(20*time.Millisecond)))
+	// Larger than the buffer, so it blocks, and nothing is popped.
+	_, err := str.WriteClass(make([]byte, 4000), congestion.ClassControl)
+	require.Error(t, err)
+	require.Equal(t, congestion.ClassBulk, str.streamClass())
+	require.GreaterOrEqual(t, notified, 3, "buffered write, blocked write, and the re-file on its return")
+}
+
+// A retransmission sent under a grant while the stream is boosted is charged
+// to CONTROL, like one sent by the ordinary classed path.
+func TestGrantedRetransmissionIsChargedAtTheBoostedClass(t *testing.T) {
+	str := newClassTestStream(t, 24)
+	writeClassBuffered(t, str, 100, congestion.ClassBulk)
+	f, _, _ := popClassed(t, str, 1200)
+	f.Handler.OnLost(f.Frame)
+	str.SetBoost(true)
+	r, _ := str.popGrantedStreamFrame(1200, 0, 1000, true, protocol.Version1)
+	require.NotNil(t, r.Frame)
+	require.Equal(t, uint8(congestion.ClassControl), r.Frame.Class)
 }

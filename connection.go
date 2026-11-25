@@ -3271,6 +3271,11 @@ func (c *Conn) appendOneShortHeaderPacket(buf *packetBuffer, maxSize protocol.By
 	if err != nil {
 		return 0, err
 	}
+	if pp, ok := c.packer.(*packetPacker); ok && pp.classBuilt {
+		if h, ok := c.sentPacketHandler.(interface{ ExpectClassBuilt() }); ok {
+			h.ExpectClassBuilt()
+		}
+	}
 	size := buf.Len() - startLen
 	c.logShortHeaderPacket(p, ecn, size)
 	c.registerPackedShortHeaderPacket(p, ecn, now)
