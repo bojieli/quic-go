@@ -17,6 +17,11 @@ var MaxDatagramSize protocol.ByteCount = 16383
 type DatagramFrame struct {
 	DataLenPresent bool
 	Data           []byte
+
+	// Tagged and Tag are local bookkeeping for the sender's datagram
+	// observer. They are not part of the wire image.
+	Tagged bool
+	Tag    uint64
 }
 
 func parseDatagramFrame(b []byte, typ FrameType, _ protocol.Version) (*DatagramFrame, int, error) {

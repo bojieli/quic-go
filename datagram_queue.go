@@ -27,6 +27,8 @@ type datagramQueue struct {
 	closed   chan struct{}
 
 	hasData func()
+	// discarded, if set, is told about frames the packer discards.
+	discarded func(*wire.DatagramFrame)
 
 	logger utils.Logger
 }
@@ -77,6 +79,33 @@ func (h *datagramQueue) Peek() *wire.DatagramFrame {
 		return nil
 	}
 	return h.sendQueue.PeekFront()
+}
+
+// PopDiscarded removes the next DATAGRAM frame without sending it.
+func (h *datagramQueue) PopDiscarded() {
+	h.sendMx.Lock()
+	f := h.sendQueue.PopFront()
+	select {
+	case h.sent <- struct{}{}:
+	default:
+	}
+	h.sendMx.Unlock()
+	if h.discarded != nil && f != nil {
+		h.discarded(f)
+	}
+}
+
+// DiscardQueued removes every queued DATAGRAM frame and reports each one.
+func (h *datagramQueue) DiscardQueued(report func(*wire.DatagramFrame)) {
+	h.sendMx.Lock()
+	var frames []*wire.DatagramFrame
+	for !h.sendQueue.Empty() {
+		frames = append(frames, h.sendQueue.PopFront())
+	}
+	h.sendMx.Unlock()
+	for _, f := range frames {
+		report(f)
+	}
 }
 
 func (h *datagramQueue) Pop() {

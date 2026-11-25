@@ -42,4 +42,14 @@ type SentPacketHandler interface {
 	MigratedPath(now monotime.Time, initialMaxPacketSize protocol.ByteCount)
 
 	SetCongestionControl(congestion.CongestionControl)
+
+	// InstallPathSender installs a congestion.PathSender. It must be called on
+	// the run loop.
+	InstallPathSender(ps congestion.PathSender, now monotime.Time, wake func())
+	// DetachPathSender detaches an installed PathSender.
+	DetachPathSender(now monotime.Time)
+	// ExpectLivenessPing says a keep-alive PING has been queued.
+	ExpectLivenessPing()
+	// BytesInFlight returns the connection's bytes in flight.
+	BytesInFlight() protocol.ByteCount
 }

@@ -217,6 +217,23 @@ type Conn struct {
 	// It is reset as soon as we receive a packet from the peer.
 	keepAlivePingSent bool
 	keepAliveInterval time.Duration
+	// keepAliveFloorSet is the adaptive keep-alive floor set by the
+	// application; keepAliveFloor is the run loop's copy. Zero keeps the fixed
+	// interval. keepAliveStep is the current interval of the schedule.
+	keepAliveFloorSet atomic.Int64
+	keepAliveFloor    time.Duration
+	keepAliveStep     time.Duration
+
+	// pendingPathSender is a PathSender waiting to be installed on the run
+	// loop. pathSender is the installed one, and is only used on the run loop.
+	pathSenderMx       sync.Mutex
+	pendingPathSender  congestion.PathSender
+	hasPendingInstall  atomic.Bool
+	pathSenderReplaced atomic.Bool
+	pathSender         congestion.PathSender
+	demand             congestion.Demand
+
+	datagramObserver atomic.Pointer[func(tag uint64, outcome DatagramOutcome)]
 
 	datagramQueue *datagramQueue
 
@@ -572,6 +589,7 @@ func (c *Conn) preSetup() {
 	c.receivedPacketHandler = *ackhandler.NewReceivedPacketHandler(c.logger)
 
 	c.datagramQueue = newDatagramQueue(c.scheduleSending, c.logger)
+	c.datagramQueue.discarded = func(f *wire.DatagramFrame) { c.observeDatagram(f, DatagramDiscarded) }
 	c.connState.Version = c.version
 }
 
@@ -691,6 +709,7 @@ runLoop:
 		// Check for loss detection timeout.
 		// This could cause packets to be declared lost, and retransmissions to be enqueued.
 		now := monotime.Now()
+		c.applyPendingSettings(now)
 		if timeout := c.sentPacketHandler.GetLossDetectionTimeout(); !timeout.IsZero() && !timeout.After(now) {
 			if err := c.sentPacketHandler.OnLossDetectionTimeout(now); err != nil {
 				c.setCloseError(&closeError{err: err})
@@ -701,8 +720,18 @@ runLoop:
 		if keepAliveTime := c.nextKeepAliveTime(); !keepAliveTime.IsZero() && !now.Before(keepAliveTime) {
 			// send a PING frame since there is no activity in the connection
 			c.logger.Debugf("Sending a keep-alive PING to keep the connection alive.")
-			c.framer.QueueControlFrame(&wire.PingFrame{})
+			if c.pathSender != nil {
+				// The PING is an exempt obligation: it can be sent while the
+				// connection is window-blocked or paced.
+				c.framer.QueueExemptFrame(&wire.PingFrame{})
+				c.sentPacketHandler.ExpectLivenessPing()
+			} else {
+				c.framer.QueueControlFrame(&wire.PingFrame{})
+			}
 			c.keepAlivePingSent = true
+			if c.keepAliveFloor > 0 {
+				c.keepAliveStep = min(2*c.currentKeepAliveStep(), c.keepAliveInterval)
+			}
 		} else if !c.handshakeComplete && now.Sub(c.creationTime) >= c.config.handshakeTimeout() {
 			c.destroyImpl(qerr.ErrHandshakeTimeout)
 			break runLoop
@@ -756,6 +785,10 @@ runLoop:
 		}
 	}
 
+	if c.pathSender != nil {
+		c.sentPacketHandler.DetachPathSender(monotime.Now())
+		c.pathSender = nil
+	}
 	closeErr := c.closeErr.Load()
 	c.cryptoStreamHandler.Close()
 	c.sendQueue.Close() // close the send queue before sending the CONNECTION_CLOSE
@@ -850,10 +883,26 @@ type ConnectionStats struct {
 	// (does not monotonically increase, because packets that are declared lost
 	// can subsequently be received).
 	PacketsLost uint64
+
+	// The transport progress fields are one coherent snapshot taken on the
+	// connection's run loop.
+	//
+	// ProgressEpoch is incremented whenever an ack-eliciting application-data
+	// packet is newly acknowledged.
+	ProgressEpoch uint64
+	// LastProgress is when ProgressEpoch last moved. It is zero before the
+	// first acknowledgement.
+	LastProgress time.Time
+	// PTOExpiriesSinceProgress counts probe timeouts since ProgressEpoch last
+	// moved. Unlike the PTO count, dropping a key does not reset it.
+	PTOExpiriesSinceProgress uint32
+	// ElicitingOutstanding says an ack-eliciting application-data packet is
+	// outstanding.
+	ElicitingOutstanding bool
 }
 
 func (c *Conn) ConnectionStats() ConnectionStats {
-	return ConnectionStats{
+	stats := ConnectionStats{
 		MinRTT:        c.rttStats.MinRTT(),
 		LatestRTT:     c.rttStats.LatestRTT(),
 		SmoothedRTT:   c.rttStats.SmoothedRTT(),
@@ -866,6 +915,14 @@ func (c *Conn) ConnectionStats() ConnectionStats {
 		BytesLost:       c.connStats.BytesLost.Load(),
 		PacketsLost:     c.connStats.PacketsLost.Load(),
 	}
+	progress := c.connStats.Progress()
+	stats.ProgressEpoch = progress.Epoch
+	if !progress.Last.IsZero() {
+		stats.LastProgress = progress.Last.ToTime()
+	}
+	stats.PTOExpiriesSinceProgress = progress.PTOExpiries
+	stats.ElicitingOutstanding = progress.ElicitingOutstanding
+	return stats
 }
 
 // Time when the connection should time out
@@ -880,8 +937,65 @@ func (c *Conn) nextKeepAliveTime() monotime.Time {
 	if c.config.KeepAlivePeriod == 0 || c.keepAlivePingSent {
 		return 0
 	}
-	keepAliveInterval := max(c.keepAliveInterval, c.rttStats.PTO(true)*3/2)
+	interval := c.keepAliveInterval
+	if c.keepAliveFloor > 0 {
+		interval = c.currentKeepAliveStep()
+	}
+	keepAliveInterval := max(interval, c.rttStats.PTO(true)*3/2)
 	return c.lastPacketReceivedTime.Add(keepAliveInterval)
+}
+
+// currentKeepAliveStep is the adaptive schedule's current interval.
+func (c *Conn) currentKeepAliveStep() time.Duration {
+	if c.keepAliveStep <= 0 {
+		return min(c.keepAliveFloor, c.keepAliveInterval)
+	}
+	return c.keepAliveStep
+}
+
+// noteApplicationPayload returns the adaptive keep-alive schedule to its
+// floor. A keep-alive PING and its acknowledgement are not payload.
+func (c *Conn) noteApplicationPayload() {
+	if c.keepAliveFloor > 0 {
+		c.keepAliveStep = 0
+	}
+}
+
+// SetKeepAliveSchedule makes the keep-alive interval adaptive: it starts at
+// floor, doubles after each keep-alive PING up to the keep-alive period, and
+// returns to floor only when application payload (stream data or a datagram)
+// is sent or received. A floor of zero restores the fixed interval. It has no
+// effect without a KeepAlivePeriod.
+func (c *Conn) SetKeepAliveSchedule(floor time.Duration) {
+	c.keepAliveFloorSet.Store(int64(max(floor, 0)))
+	c.scheduleSending()
+}
+
+// applyPendingSettings applies settings that the application posted to the
+// run loop: a PathSender installation and the keep-alive schedule.
+func (c *Conn) applyPendingSettings(now monotime.Time) {
+	if floor := time.Duration(c.keepAliveFloorSet.Load()); floor != c.keepAliveFloor {
+		c.keepAliveFloor = floor
+		c.keepAliveStep = 0
+	}
+	if c.pathSenderReplaced.Load() {
+		c.pathSenderReplaced.Store(false)
+		c.pathSender = nil
+	}
+	if !c.hasPendingInstall.Load() {
+		return
+	}
+	c.pathSenderMx.Lock()
+	ps := c.pendingPathSender
+	c.pendingPathSender = nil
+	c.hasPendingInstall.Store(false)
+	c.pathSenderMx.Unlock()
+	if ps == nil {
+		return
+	}
+	c.sentPacketHandler.InstallPathSender(ps, now, c.scheduleSending)
+	c.pathSender = ps
+	c.demand = congestion.Demand{}
 }
 
 func (c *Conn) maybeResetTimer() {
@@ -893,8 +1007,9 @@ func (c *Conn) maybeResetTimer() {
 		}
 	} else {
 		// A keep-alive packet is ack-eliciting, so it can only be sent if the connection is
-		// neither congestion limited nor hard-blocked.
-		if c.blocked != blockModeNone {
+		// neither congestion limited nor hard-blocked. For a PathSender it is an
+		// exempt obligation, which only a hard block stops.
+		if c.blocked == blockModeHardBlocked || (c.blocked != blockModeNone && c.pathSender == nil) {
 			deadline = c.nextIdleTimeoutTime()
 		} else {
 			if keepAliveTime := c.nextKeepAliveTime(); !keepAliveTime.IsZero() {
@@ -937,6 +1052,12 @@ func (c *Conn) idleTimeoutStartTime() monotime.Time {
 }
 
 func (c *Conn) switchToNewPath(tr *Transport, now monotime.Time) {
+	oldLocal, oldRemote := c.conn.LocalAddr(), c.conn.RemoteAddr()
+	defer func() {
+		if c.pathSender != nil {
+			c.pathSender.OnPathMigrated(now, oldLocal, c.conn.LocalAddr(), oldRemote, c.conn.RemoteAddr())
+		}
+	}()
 	initialPacketSize := protocol.ByteCount(c.config.InitialPacketSize)
 	c.sentPacketHandler.MigratedPath(now, initialPacketSize)
 	maxPacketSize := protocol.ByteCount(protocol.MaxPacketBufferSize)
@@ -1323,6 +1444,7 @@ func (c *Conn) handleShortHeaderPacket(
 		return true, nil
 	}
 	c.pathManager.SwitchToPath(p.remoteAddr)
+	oldLocal, oldRemote := c.conn.LocalAddr(), c.conn.RemoteAddr()
 	c.sentPacketHandler.MigratedPath(p.rcvTime, protocol.ByteCount(c.config.InitialPacketSize))
 	maxPacketSize := protocol.ByteCount(protocol.MaxPacketBufferSize)
 	if c.peerParams.MaxUDPPayloadSize > 0 && c.peerParams.MaxUDPPayloadSize < maxPacketSize {
@@ -1334,6 +1456,9 @@ func (c *Conn) handleShortHeaderPacket(
 		maxPacketSize,
 	)
 	c.conn.ChangeRemoteAddr(p.remoteAddr, p.info)
+	if c.pathSender != nil {
+		c.pathSender.OnPathMigrated(p.rcvTime, oldLocal, c.conn.LocalAddr(), oldRemote, c.conn.RemoteAddr())
+	}
 	return true, nil
 }
 
@@ -1835,6 +1960,9 @@ func (c *Conn) handleFrames(
 		if !wire.IsProbingFrameType(frameType) {
 			isNonProbing = true
 		}
+		if c.keepAliveFloor > 0 && (frameType.IsStreamFrameType() || frameType.IsDatagramFrameType()) {
+			c.noteApplicationPayload()
+		}
 
 		// We're inlining common cases, to avoid using interfaces
 		// Fast path: STREAM, DATAGRAM and ACK
@@ -2291,6 +2419,9 @@ func (c *Conn) handleCloseError(closeErr *closeError) {
 	c.streamsMap.CloseWithError(e)
 	if c.datagramQueue != nil {
 		c.datagramQueue.CloseWithError(e)
+		if c.datagramObserver.Load() != nil {
+			c.datagramQueue.DiscardQueued(func(f *wire.DatagramFrame) { c.observeDatagram(f, DatagramDiscarded) })
+		}
 	}
 
 	// In rare instances, the connection ID manager might switch to a new connection ID
@@ -2484,6 +2615,9 @@ func (c *Conn) applyTransportParameters() {
 
 func (c *Conn) triggerSending(now monotime.Time) error {
 	c.pacingDeadline = 0
+	if c.pathSender != nil {
+		c.updateDemand()
+	}
 
 	sendMode := c.sentPacketHandler.SendMode(now)
 	switch sendMode {
@@ -2498,6 +2632,9 @@ func (c *Conn) triggerSending(now monotime.Time) error {
 			deadline = deadlineSendImmediately
 		}
 		c.pacingDeadline = deadline
+		if c.pathSender != nil {
+			return c.maybeSendExemptPacket(now)
+		}
 		// Allow sending of an ACK if we're pacing limit.
 		// This makes sure that a peer that is mostly receiving data (and thus has an inaccurate cwnd estimate)
 		// sends enough ACKs to allow its peer to utilize the bandwidth.
@@ -2507,6 +2644,9 @@ func (c *Conn) triggerSending(now monotime.Time) error {
 		// There will only be a new ACK after receiving new packets.
 		// SendAck is only returned when we're congestion limited, so we don't need to set the pacing timer.
 		c.blocked = blockModeCongestionLimited
+		if c.pathSender != nil {
+			return c.maybeSendExemptPacket(now)
+		}
 		return c.maybeSendAckOnlyPacket(now)
 	case ackhandler.SendPTOInitial, ackhandler.SendPTOHandshake, ackhandler.SendPTOAppData:
 		if err := c.sendProbePacket(sendMode, now); err != nil {
@@ -2522,24 +2662,89 @@ func (c *Conn) triggerSending(now monotime.Time) error {
 	}
 }
 
-func (c *Conn) sendPackets(now monotime.Time) error {
-	if c.perspective == protocol.PerspectiveClient && c.handshakeConfirmed {
-		if pm := c.pathManagerOutgoing.Load(); pm != nil {
-			connID, frame, tr, ok := pm.NextPathToProbe()
-			if ok {
-				probe, buf, err := c.packer.PackPathProbePacket(connID, []ackhandler.Frame{frame}, c.version)
-				if err != nil {
-					return err
-				}
-				c.logger.Debugf("sending path probe packet from %s", c.LocalAddr())
-				c.logShortHeaderPacket(probe, protocol.ECNNon, buf.Len())
-				c.registerPackedShortHeaderPacket(probe, protocol.ECNNon, now)
-				tr.WriteTo(buf.Data, c.conn.RemoteAddr())
-				// There's (likely) more data to send. Loop around again.
-				c.scheduleSending()
-				return nil
-			}
+// maybeSendPathProbe sends the client's next PATH_CHALLENGE, if one is due.
+func (c *Conn) maybeSendPathProbe(now monotime.Time) (bool, error) {
+	if c.perspective != protocol.PerspectiveClient || !c.handshakeConfirmed {
+		return false, nil
+	}
+	pm := c.pathManagerOutgoing.Load()
+	if pm == nil {
+		return false, nil
+	}
+	connID, frame, tr, ok := pm.NextPathToProbe()
+	if !ok {
+		return false, nil
+	}
+	probe, buf, err := c.packer.PackPathProbePacket(connID, []ackhandler.Frame{frame}, c.version)
+	if err != nil {
+		return false, err
+	}
+	c.logger.Debugf("sending path probe packet from %s", c.LocalAddr())
+	c.logShortHeaderPacket(probe, protocol.ECNNon, buf.Len())
+	c.registerPackedShortHeaderPacket(probe, protocol.ECNNon, now)
+	tr.WriteTo(buf.Data, c.conn.RemoteAddr())
+	return true, nil
+}
+
+// maybeSendExemptPacket is the exempt build path of a PathSender. When Admit
+// refuses, the connection may still build one packet that carries only exempt
+// obligations: an ACK, a liveness PING, PATH_CHALLENGE or PATH_RESPONSE. It is
+// subject to the amplification limit (SendMode returns SendNone before it) and
+// to socket back-pressure (the run loop does not trigger sending while the
+// send queue would block), and its bytes are settled at OnSent.
+func (c *Conn) maybeSendExemptPacket(now monotime.Time) error {
+	if !c.handshakeConfirmed {
+		return c.maybeSendAckOnlyPacket(now)
+	}
+	sent, err := c.maybeSendPathProbe(now)
+	if err != nil || sent {
+		if sent {
+			c.scheduleSending()
 		}
+		return err
+	}
+	ecn := c.sentPacketHandler.ECNMode(true)
+	p, buf, err := c.packer.PackExemptPacket(c.maxPacketSize(), now, c.version)
+	if err != nil {
+		if err == errNothingToPack {
+			return nil
+		}
+		return err
+	}
+	c.logShortHeaderPacket(p, ecn, buf.Len())
+	c.registerPackedShortHeaderPacket(p, ecn, now)
+	c.sendQueue.Send(buf, 0, ecn)
+	return nil
+}
+
+// updateDemand reports the connection's eligible demand to its PathSender
+// when it changed. The query consumes nothing. Without class tags, stream data
+// is BULK, datagrams INTERACTIVE, and control frames, retransmissions, due
+// window updates and post-handshake crypto data CONTROL. Stream data counts
+// only while the connection-level send window is open; stream-level flow
+// control is not consulted.
+func (c *Conn) updateDemand() {
+	var d congestion.Demand
+	d.Eligible[congestion.ClassExempt] = c.framer.HasExemptData()
+	d.Eligible[congestion.ClassControl] = c.framer.HasControlData() ||
+		c.retransmissionQueue.HasData(protocol.Encryption1RTT) ||
+		c.connFlowController.HasWindowUpdate() ||
+		c.cryptoStreamManager.HasPostHandshakeData()
+	d.Eligible[congestion.ClassInteractive] = c.datagramQueue != nil && c.datagramQueue.Peek() != nil
+	d.Eligible[congestion.ClassBulk] = c.framer.HasStreamData() && c.connFlowController.SendWindowSize() > 0
+	if d != c.demand {
+		c.demand = d
+		c.pathSender.OnDemand(d)
+	}
+}
+
+func (c *Conn) sendPackets(now monotime.Time) error {
+	if sent, err := c.maybeSendPathProbe(now); err != nil || sent {
+		if sent {
+			// There's (likely) more data to send. Loop around again.
+			c.scheduleSending()
+		}
+		return err
 	}
 
 	// Path MTU Discovery
@@ -2800,6 +3005,12 @@ func (c *Conn) registerPackedShortHeaderPacket(p shortHeaderPacket, ecn protocol
 	if c.firstAckElicitingPacketAfterIdleSentTime.IsZero() && (len(p.StreamFrames) > 0 || ackhandler.HasAckElicitingFrames(p.Frames)) {
 		c.firstAckElicitingPacketAfterIdleSentTime = now
 	}
+	if len(p.StreamFrames) > 0 {
+		c.noteApplicationPayload()
+	}
+	if c.keepAliveFloor > 0 || c.datagramObserver.Load() != nil {
+		c.registeredDatagrams(p.Frames)
+	}
 
 	largestAcked := protocol.InvalidPacketNumber
 	if p.Ack != nil {
@@ -2842,6 +3053,9 @@ func (c *Conn) sendPackedCoalescedPacket(packet *coalescedPacket, ecn protocol.E
 			false,
 			false,
 		)
+		if c.keepAliveFloor > 0 || c.datagramObserver.Load() != nil {
+			c.registeredDatagrams(p.frames)
+		}
 		if c.perspective == protocol.PerspectiveClient && p.EncryptionLevel() == protocol.EncryptionHandshake &&
 			!c.droppedInitialKeys {
 			// On the client side, Initial keys are dropped as soon as the first Handshake packet is sent.
@@ -2871,6 +3085,12 @@ func (c *Conn) sendPackedCoalescedPacket(packet *coalescedPacket, ecn protocol.E
 			p.IsPathMTUProbePacket,
 			false,
 		)
+		if len(p.StreamFrames) > 0 {
+			c.noteApplicationPayload()
+		}
+		if c.keepAliveFloor > 0 || c.datagramObserver.Load() != nil {
+			c.registeredDatagrams(p.Frames)
+		}
 	}
 	c.connIDManager.SentPacket()
 	c.sendQueue.Send(packet.buffer, 0, ecn)
@@ -3060,11 +3280,15 @@ func (c *Conn) onStreamCompleted(id protocol.StreamID) {
 // In addition, a datagram may be dropped before being sent out if the available packet size suddenly decreases.
 // If the payload is too large to be sent at the current time, a DatagramTooLargeError is returned.
 func (c *Conn) SendDatagram(p []byte) error {
+	return c.sendDatagram(p, false, 0)
+}
+
+func (c *Conn) sendDatagram(p []byte, tagged bool, tag uint64) error {
 	if !c.supportsDatagrams() {
 		return errors.New("datagram support disabled")
 	}
 
-	f := &wire.DatagramFrame{DataLenPresent: true}
+	f := &wire.DatagramFrame{DataLenPresent: true, Tagged: tagged, Tag: tag}
 	maxDatagramFrameSize := c.peerMaxDatagramFrameSize()
 	// The payload size estimate is conservative.
 	// Under many circumstances we could send a few more bytes.
@@ -3078,6 +3302,54 @@ func (c *Conn) SendDatagram(p []byte) error {
 	f.Data = make([]byte, len(p))
 	copy(f.Data, p)
 	return c.datagramQueue.Add(f)
+}
+
+// DatagramOutcome is what became of a tagged datagram.
+type DatagramOutcome uint8
+
+const (
+	// DatagramRegistered says the packet carrying the datagram was registered
+	// for sending.
+	DatagramRegistered DatagramOutcome = iota + 1
+	// DatagramDiscarded says the datagram will never be sent: the packer
+	// dropped it, or the connection closed with it queued.
+	DatagramDiscarded
+)
+
+// SendDatagramTagged is SendDatagram with a tag that the datagram observer is
+// told about, on the run loop, when the datagram's packet is registered or the
+// datagram is discarded.
+func (c *Conn) SendDatagramTagged(p []byte, tag uint64) error {
+	return c.sendDatagram(p, true, tag)
+}
+
+// SetDatagramObserver sets the function told about tagged datagrams. It is
+// called on the connection's run loop and must not block.
+func (c *Conn) SetDatagramObserver(f func(tag uint64, outcome DatagramOutcome)) {
+	if f == nil {
+		c.datagramObserver.Store(nil)
+		return
+	}
+	c.datagramObserver.Store(&f)
+}
+
+func (c *Conn) observeDatagram(f *wire.DatagramFrame, outcome DatagramOutcome) {
+	if !f.Tagged {
+		return
+	}
+	if obs := c.datagramObserver.Load(); obs != nil {
+		(*obs)(f.Tag, outcome)
+	}
+}
+
+// registeredDatagrams is called for every registered packet.
+func (c *Conn) registeredDatagrams(frames []ackhandler.Frame) {
+	for _, f := range frames {
+		if df, ok := f.Frame.(*wire.DatagramFrame); ok {
+			c.noteApplicationPayload()
+			c.observeDatagram(df, DatagramRegistered)
+		}
+	}
 }
 
 // ReceiveDatagram gets a message received in a QUIC datagram, as specified in RFC 9221.
@@ -3186,7 +3458,24 @@ func estimateMaxPayloadSize(mtu protocol.ByteCount) protocol.ByteCount {
 }
 
 // SetCongestionControl replace the current congestion control algorithm with a new one.
+//
+// A congestion.PathSender is installed on the connection's run loop, not
+// here: OnAttach is its first call and carries the connection's flight at that
+// moment. Any other controller is installed immediately.
 func (c *Conn) SetCongestionControl(cc congestion.CongestionControl) {
+	if ps, ok := cc.(congestion.PathSender); ok {
+		c.pathSenderMx.Lock()
+		c.pendingPathSender = ps
+		c.hasPendingInstall.Store(true)
+		c.pathSenderMx.Unlock()
+		c.scheduleSending()
+		return
+	}
+	c.pathSenderMx.Lock()
+	c.pendingPathSender = nil
+	c.hasPendingInstall.Store(false)
+	c.pathSenderMx.Unlock()
+	c.pathSenderReplaced.Store(true)
 	c.sentPacketHandler.SetCongestionControl(cc)
 }
 

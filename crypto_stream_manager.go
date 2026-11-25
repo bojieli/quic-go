@@ -53,6 +53,9 @@ func (m *cryptoStreamManager) GetCryptoData(encLevel protocol.EncryptionLevel) [
 	}
 }
 
+// HasPostHandshakeData says whether post-handshake crypto data is queued.
+func (m *cryptoStreamManager) HasPostHandshakeData() bool { return m.oneRTTStream.HasData() }
+
 func (m *cryptoStreamManager) GetPostHandshakeData(maxSize protocol.ByteCount) *wire.CryptoFrame {
 	if !m.oneRTTStream.HasData() {
 		return nil
