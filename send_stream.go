@@ -563,7 +563,10 @@ func (s *SendStream) AcceptedOffset() protocol.ByteCount {
 // popGrantedStreamFrame pops a frame that carries only bytes of [start, end):
 // a queued retransmission inside the range first, then new data at the write
 // offset. It is the verification grant's build path.
-func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCount, v protocol.Version) (ackhandler.StreamFrame, *wire.StreamDataBlockedFrame) {
+//
+// classed says the connection schedules classes: only then is new data cut
+// at class boundaries and stamped with its class.
+func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCount, classed bool, v protocol.Version) (ackhandler.StreamFrame, *wire.StreamDataBlockedFrame) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	if s.shutdownErr != nil || (s.resetErr != nil && s.reliableOffset() == 0) {
@@ -624,7 +627,8 @@ func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCou
 	queued := s.retransmissionQueue
 	s.retransmissionQueue = nil
 	var class congestion.SendClass
-	if s.classTagged {
+	stamp := classed && s.classTagged
+	if stamp {
 		// The frame carries its class, for its retransmissions, and does
 		// not mix classes.
 		var end protocol.ByteCount
@@ -639,8 +643,10 @@ func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCou
 	if f == nil {
 		return ackhandler.StreamFrame{}, blocked
 	}
-	if s.classTagged {
+	if stamp {
 		f.Class = uint8(class)
+	}
+	if s.classTagged {
 		s.pruneClassSegs()
 	}
 	// The prefix-repair capture happens here as on the ordinary path; its

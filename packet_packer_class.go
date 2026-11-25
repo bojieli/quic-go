@@ -19,16 +19,12 @@ var _ classedFrameSource = &framer{}
 // classOrder is the order in which classes fill a packet after its turn.
 var classOrder = [...]congestion.SendClass{congestion.ClassControl, congestion.ClassInteractive, congestion.ClassBulk}
 
-// minClassedPayload is the least payload a class-scheduled packet is built
-// in. An ACK frame truncated to its first range, with ECN counts, and a PING
-// fit in it, so a packet is never built larger than its permit. A permit
-// smaller than this builds nothing: it is the scheduler's to size.
-const minClassedPayload protocol.ByteCount = 64
-
-// maxAppPacketOverhead bounds an application packet's header and AEAD tag:
-// a 0-RTT long header with two maximum-length connection IDs, a two-byte
-// length and a four-byte packet number, and a 16-byte tag.
-const maxAppPacketOverhead protocol.ByteCount = 1 + 4 + 1 + 20 + 1 + 20 + 2 + 4 + 16
+// minAckPayload is the least payload an ACK is put in under a class permit:
+// an ACK frame truncated to its first range, with ECN counts, and a PING fit
+// in it, so taking the ACK never makes a packet larger than its permit. A
+// smaller permit leaves the ACK for a later packet and still carries what
+// fits.
+const minAckPayload protocol.ByteCount = 64
 
 // currentClassPermit returns the permit the next packet is built under, if
 // the connection schedules classes and holds a permit. A permit of zero bytes
@@ -47,17 +43,17 @@ func (p *packetPacker) currentClassPermit(onlyAck bool) (congestion.Permit, bool
 	return permit, true
 }
 
-// maybeGetClassedPacket builds a 1-RTT (or 0-RTT) payload under a
+// maybeGetClassedPacket builds a 1-RTT payload under a
 // class-scheduling permit (congestion.ClassScheduler): exempt obligations,
 // then bytes of the permit's turn, then bytes of each class listed in Fill up
 // to its allowance. Whatever space is left stays empty. fullPayload is the
 // payload a packet of the connection's maximum size would have, which decides
 // whether a DATAGRAM can ever be sent; zero means it is not known here.
 func (p *packetPacker) maybeGetClassedPacket(maxPayloadSize, fullPayload protocol.ByteCount, permit congestion.Permit, ackAllowed bool, now monotime.Time, v protocol.Version) payload {
-	if maxPayloadSize < minClassedPayload {
+	if maxPayloadSize <= 0 {
 		return payload{}
 	}
-	pl := p.composeClassedPacket(maxPayloadSize, fullPayload, permit, ackAllowed, now, v)
+	pl := p.composeClassedPacket(maxPayloadSize, fullPayload, permit, ackAllowed && maxPayloadSize >= minAckPayload, now, v)
 	if len(pl.frames) == 0 && len(pl.streamFrames) == 0 {
 		if pl.ack == nil {
 			return payload{}

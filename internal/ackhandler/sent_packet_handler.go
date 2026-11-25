@@ -617,9 +617,11 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	}
 
 	if ps == nil {
-		// The controller installed now: one replaced during this ACK gets
-		// no aggregate event after its replacement.
-		if cex, ok := h.getCongestionControl().(congestion.SendAlgorithmEx); ok &&
+		// The aggregate event goes to the controller that received this
+		// ACK's per-packet callbacks, and only while it is still installed:
+		// a controller replaced meanwhile gets nothing after its
+		// replacement, and its successor nothing that was its.
+		if cex, ok := cc.(congestion.SendAlgorithmEx); ok && h.getCongestionControl() == cc &&
 			(len(h.ackedPacketsInfo) != 0 || len(h.lostPacketsInfo) != 0) {
 			cex.OnCongestionEventEx(priorInFlight, rcvTime, h.ackedPacketsInfo, h.lostPacketsInfo)
 		}

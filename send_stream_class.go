@@ -74,7 +74,8 @@ func (s *SendStream) SetBoost(on bool) {
 			s.recordClass(s.writeOffset, congestion.ClassControl)
 		}
 	}
-	notify := s.holdsData()
+	// Anything the stream could send, a FIN or a prefix repair included.
+	notify := s.holdsData() || s.hasSendableDataLocked(true)
 	s.mutex.Unlock()
 	if notify {
 		// The effective class changed: the framer re-files the stream, and

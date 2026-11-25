@@ -270,6 +270,28 @@ func (f *framer) appendOrdinaryControlFrames(
 	now monotime.Time,
 	v protocol.Version,
 ) ([]ackhandler.Frame, protocol.ByteCount) {
+	frames, length = f.appendStreamControlFrames(frames, length, maxLen, now, v)
+	for len(f.controlFrames) > 0 {
+		frame := f.controlFrames[len(f.controlFrames)-1]
+		frameLen := frame.Length(v)
+		if length+frameLen > maxLen {
+			break
+		}
+		frames = append(frames, ackhandler.Frame{Frame: frame})
+		length += frameLen
+		f.controlFrames = f.controlFrames[:len(f.controlFrames)-1]
+	}
+	return frames, length
+}
+
+// appendStreamControlFrames appends the streams' control frames.
+func (f *framer) appendStreamControlFrames(
+	frames []ackhandler.Frame,
+	length protocol.ByteCount,
+	maxLen protocol.ByteCount,
+	now monotime.Time,
+	v protocol.Version,
+) ([]ackhandler.Frame, protocol.ByteCount) {
 	// add stream-related control frames
 	for id, str := range f.streamsWithControlFrames {
 	start:
@@ -291,17 +313,6 @@ func (f *framer) appendOrdinaryControlFrames(
 			// We don't want to spawn another loop for just to cover that case.
 			goto start
 		}
-	}
-
-	for len(f.controlFrames) > 0 {
-		frame := f.controlFrames[len(f.controlFrames)-1]
-		frameLen := frame.Length(v)
-		if length+frameLen > maxLen {
-			break
-		}
-		frames = append(frames, ackhandler.Frame{Frame: frame})
-		length += frameLen
-		f.controlFrames = f.controlFrames[:len(f.controlFrames)-1]
 	}
 
 	return frames, length

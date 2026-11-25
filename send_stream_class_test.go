@@ -130,7 +130,7 @@ func TestGrantedFramesCarryTheirClass(t *testing.T) {
 	str := newClassTestStream(t, 16)
 	writeClassBuffered(t, str, 100, congestion.ClassInteractive)
 	writeClassBuffered(t, str, 100, congestion.ClassBulk)
-	f, _ := str.popGrantedStreamFrame(1200, 0, 1000, protocol.Version1)
+	f, _ := str.popGrantedStreamFrame(1200, 0, 1000, true, protocol.Version1)
 	require.NotNil(t, f.Frame)
 	require.Equal(t, protocol.ByteCount(100), f.Frame.DataLen(), "a granted frame does not mix classes")
 	require.Equal(t, uint8(congestion.ClassInteractive), f.Frame.Class)

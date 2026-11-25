@@ -32,7 +32,8 @@ func (r *demandRecorder) last() congestion.Demand {
 	return r.demands[len(r.demands)-1]
 }
 
-func (r *demandRecorder) OnAttach(monotime.Time, congestion.ByteCount, congestion.ByteCount, func()) {}
+func (r *demandRecorder) OnAttach(monotime.Time, congestion.ByteCount, congestion.ByteCount, func()) {
+}
 func (r *demandRecorder) OnDemand(d congestion.Demand) {
 	r.mu.Lock()
 	r.demands = append(r.demands, d)
@@ -41,7 +42,7 @@ func (r *demandRecorder) OnDemand(d congestion.Demand) {
 func (r *demandRecorder) Admit(monotime.Time, congestion.ByteCount) congestion.Permit {
 	return congestion.Permit{}
 }
-func (r *demandRecorder) OnSent(congestion.SentPacket)    {}
+func (r *demandRecorder) OnSent(congestion.SentPacket)   {}
 func (r *demandRecorder) OnAckEvent(congestion.AckEvent) {}
 func (r *demandRecorder) OnDiscarded(monotime.Time, congestion.ByteCount, []congestion.PacketRef, bool, congestion.DiscardReason) {
 }

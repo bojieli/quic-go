@@ -59,7 +59,7 @@ func TestSendStreamGrantedFramesStayInTheirRange(t *testing.T) {
 }
 
 func grantedFrame(str *SendStream, start, end protocol.ByteCount) ackhandler.StreamFrame {
-	f, _ := str.popGrantedStreamFrame(1200, start, end, protocol.Version1)
+	f, _ := str.popGrantedStreamFrame(1200, start, end, false, protocol.Version1)
 	return f
 }
 
@@ -98,7 +98,7 @@ func TestSendStreamGrantedFrameSizedByItsLengthField(t *testing.T) {
 	_, err := (&writerWithTimeout{Writer: str, Timeout: time.Second}).Write(make([]byte, 100))
 	require.NoError(t, err)
 	exact := (&wire.StreamFrame{StreamID: streamID, DataLenPresent: true, Data: make([]byte, 100)}).Length(protocol.Version1)
-	f, _ := str.popGrantedStreamFrame(exact, 0, 100, protocol.Version1)
+	f, _ := str.popGrantedStreamFrame(exact, 0, 100, false, protocol.Version1)
 	require.NotNil(t, f.Frame)
 	require.Equal(t, protocol.ByteCount(100), f.Frame.DataLen())
 }

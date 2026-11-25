@@ -147,21 +147,34 @@ func (f *framer) hasClassedStreams() bool {
 }
 
 // StreamDemand reports per class whether an active stream of that effective
-// class could send a frame now. It consumes nothing.
+// class could send a frame now. It consumes nothing. Each class's ring is
+// walked in order, and a stream is asked only until one of the class can
+// send, so a class of busy streams costs one stream lock, not one per stream.
+// A stream asked whose class changed is counted for its current class.
 func (f *framer) StreamDemand(connWindow bool) [congestion.NumSendClasses]bool {
 	var d [congestion.NumSendClasses]bool
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
-	for _, str := range f.activeStreams {
-		cs, ok := str.(classedStream)
-		if !ok {
-			if s, ok := str.(interface{ hasSendableData(bool) bool }); !ok || s.hasSendableData(connWindow) {
-				d[congestion.ClassBulk] = true
+	for _, class := range classOrder {
+		ring := &f.classRings[class]
+		for range ring.Len() {
+			// A full rotation leaves the ring's order as it was.
+			e := ring.PopFront()
+			ring.PushBack(e)
+			if d[class] || !f.live(e) {
+				continue
 			}
-			continue
-		}
-		if class, sendable := cs.sendableClass(connWindow); sendable {
-			d[class] = true
+			str := f.activeStreams[e.id]
+			cs, ok := str.(classedStream)
+			if !ok {
+				if s, ok := str.(interface{ hasSendableData(bool) bool }); !ok || s.hasSendableData(connWindow) {
+					d[congestion.ClassBulk] = true
+				}
+				continue
+			}
+			if c, sendable := cs.sendableClass(connWindow); sendable {
+				d[c] = true
+			}
 		}
 	}
 	return d
@@ -188,7 +201,7 @@ func (f *framer) AppendClass(
 	defer f.controlFrameMutex.Unlock()
 	var length protocol.ByteCount
 	if class == congestion.ClassControl {
-		frames, length = f.appendOrdinaryControlFrames(frames, 0, maxLen, now, v)
+		frames, length = f.appendClassedControlFrames(frames, maxLen, now, v)
 	}
 
 	f.mutex.Lock()
@@ -215,6 +228,39 @@ func (f *framer) AppendClass(
 		}
 	}
 	return frames, streamFrames, length
+}
+
+// appendClassedControlFrames is the CONTROL pass's share of the queued
+// control frames other than exempt obligations. A class budget can be
+// smaller than a packet, so unlike the ordinary builder it does not stop at
+// the first frame that does not fit: smaller ones behind it still go, and a
+// CRYPTO frame is split to the space left. It must be called with
+// controlFrameMutex held.
+func (f *framer) appendClassedControlFrames(frames []ackhandler.Frame, maxLen protocol.ByteCount, now monotime.Time, v protocol.Version) ([]ackhandler.Frame, protocol.ByteCount) {
+	frames, length := f.appendStreamControlFrames(frames, 0, maxLen, now, v)
+	kept := f.controlFrames[:0:0]
+	for i := len(f.controlFrames) - 1; i >= 0; i-- {
+		frame := f.controlFrames[i]
+		room := maxLen - length
+		if l := frame.Length(v); l <= room {
+			frames = append(frames, ackhandler.Frame{Frame: frame})
+			length += l
+			continue
+		}
+		if cf, ok := frame.(*wire.CryptoFrame); ok && room > 0 {
+			if head, split := cf.MaybeSplitOffFrame(room, v); split && head != nil {
+				frames = append(frames, ackhandler.Frame{Frame: head})
+				length += head.Length(v)
+			}
+		}
+		kept = append(kept, frame)
+	}
+	// kept is in pop order; the queue is popped from its end.
+	for l, r := 0, len(kept)-1; l < r; l, r = l+1, r-1 {
+		kept[l], kept[r] = kept[r], kept[l]
+	}
+	f.controlFrames = kept
+	return frames, length
 }
 
 // refile files every active stream in the ring of its current class, and

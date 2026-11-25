@@ -254,8 +254,8 @@ func TestOrdinaryBuildOnAClassedFramerServesEveryClass(t *testing.T) {
 	require.Equal(t, sum, pl.length)
 }
 
-// Small permits still move a stream; a permit too small for a minimal packet
-// builds nothing rather than an oversized packet or an unrestricted one.
+// Small permits still move a stream; a zero-byte permit builds nothing
+// rather than an unrestricted packet.
 func TestClassedBuilderUnderSmallPermits(t *testing.T) {
 	h := newBuilderHarness(true)
 	bulk := h.stream(4)
@@ -264,7 +264,11 @@ func TestClassedBuilderUnderSmallPermits(t *testing.T) {
 	pl := h.packer.maybeGetClassedPacket(70, 1200, permit, true, monotime.Now(), protocol.Version1)
 	require.Len(t, pl.streamFrames, 1, "a 70-byte payload carries a STREAM frame")
 	require.LessOrEqual(t, pl.length, protocol.ByteCount(70))
-	require.Empty(t, h.packer.maybeGetClassedPacket(minClassedPayload-1, 1200, permit, true, monotime.Now(), protocol.Version1).streamFrames)
+	// Below the room an ACK needs, the ACK waits and a STREAM frame still goes.
+	pl = h.packer.maybeGetClassedPacket(40, 1200, permit, true, monotime.Now(), protocol.Version1)
+	require.Len(t, pl.streamFrames, 1)
+	require.Nil(t, pl.ack)
+	require.LessOrEqual(t, pl.length, protocol.ByteCount(40))
 	require.Empty(t, h.packer.maybeGetClassedPacket(0, 1200, congestion.Permit{OK: true, Turn: congestion.ClassBulk}, true, monotime.Now(), protocol.Version1).streamFrames)
 }
 
@@ -393,7 +397,7 @@ func TestClassedBuilderSendsTheDatagramBehindADiscardedOne(t *testing.T) {
 
 // At every small payload the last STREAM frame, length field removed, fits.
 func TestClassedBuilderLastFrameFitsAtVarintBoundaries(t *testing.T) {
-	for size := minClassedPayload; size <= 200; size++ {
+	for size := protocol.ByteCount(20); size <= 200; size++ {
 		h := newBuilderHarness(true)
 		str := h.stream(4)
 		writeClassBuffered(t, str, 1000, congestion.ClassBulk)
@@ -421,4 +425,27 @@ func TestClassedFramerCompactsStaleEntries(t *testing.T) {
 	defer h.framer.mutex.Unlock()
 	require.LessOrEqual(t, h.framer.classRings[congestion.ClassBulk].Len(), 64)
 	require.LessOrEqual(t, h.framer.classRings[congestion.ClassControl].Len(), 64)
+}
+
+// A CONTROL allowance smaller than a queued CRYPTO frame still moves it, a
+// piece at a time, and the control frames behind it are not held up.
+func TestClassedControlPassSplitsCryptoAndSkipsWhatDoesNotFit(t *testing.T) {
+	h := newBuilderHarness(true)
+	h.framer.QueueControlFrame(&wire.MaxStreamsFrame{MaxStreamNum: 9})
+	h.framer.QueueControlFrame(&wire.CryptoFrame{Data: make([]byte, 900)})
+	var crypto protocol.ByteCount
+	for range 4 {
+		pl := h.packer.composeClassedPacket(testPayload, testPayload, congestion.Permit{OK: true, Turn: congestion.ClassBulk, MaxBytes: 1252,
+			Fill: [congestion.NumSendClasses]congestion.ByteCount{congestion.ClassControl: 300}}, true, monotime.Now(), protocol.Version1)
+		var used protocol.ByteCount
+		for _, f := range pl.frames {
+			used += f.Frame.Length(protocol.Version1)
+			if cf, ok := f.Frame.(*wire.CryptoFrame); ok {
+				crypto += protocol.ByteCount(len(cf.Data))
+			}
+		}
+		require.LessOrEqual(t, used, protocol.ByteCount(300))
+	}
+	require.Equal(t, protocol.ByteCount(900), crypto)
+	require.False(t, h.framer.HasControlData())
 }

@@ -2777,7 +2777,7 @@ func (c *Conn) maybeSendExemptPacket(now monotime.Time) error {
 				return ackhandler.StreamFrame{}
 			}
 			maxLen = min(maxLen, protocol.ByteCount(g.remaining)-committed)
-			sf, blocked := g.str.popGrantedStreamFrame(maxLen, protocol.ByteCount(g.grant.Start), protocol.ByteCount(g.grant.End), v)
+			sf, blocked := g.str.popGrantedStreamFrame(maxLen, protocol.ByteCount(g.grant.Start), protocol.ByteCount(g.grant.End), c.classed, v)
 			if blocked != nil {
 				// Ordinary control work, not covered by the grant.
 				c.framer.QueueControlFrame(blocked)
@@ -2997,8 +2997,12 @@ func (c *Conn) setClassed(on bool) {
 
 // currentClassPermit is the packer's view of the permit the next packet is
 // built under, while the PathSender schedules classes.
+//
+// Permits apply from handshake confirmation on. Before it, packets are
+// coalesced with Initial and Handshake packets whose CRYPTO data and padding
+// the handshake dictates, so they are built as for any other PathSender.
 func (c *Conn) currentClassPermit() (congestion.Permit, bool) {
-	if !c.classed {
+	if !c.classed || !c.handshakeConfirmed {
 		return congestion.Permit{}, false
 	}
 	ph, ok := c.sentPacketHandler.(interface {
