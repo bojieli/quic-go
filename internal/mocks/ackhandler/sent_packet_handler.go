@@ -44,6 +44,44 @@ func (m *MockSentPacketHandler) EXPECT() *MockSentPacketHandlerMockRecorder {
 	return m.recorder
 }
 
+// AdmissionRefused mocks base method.
+func (m *MockSentPacketHandler) AdmissionRefused() bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "AdmissionRefused")
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// AdmissionRefused indicates an expected call of AdmissionRefused.
+func (mr *MockSentPacketHandlerMockRecorder) AdmissionRefused() *MockSentPacketHandlerAdmissionRefusedCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AdmissionRefused", reflect.TypeOf((*MockSentPacketHandler)(nil).AdmissionRefused))
+	return &MockSentPacketHandlerAdmissionRefusedCall{Call: call}
+}
+
+// MockSentPacketHandlerAdmissionRefusedCall wrap *gomock.Call
+type MockSentPacketHandlerAdmissionRefusedCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockSentPacketHandlerAdmissionRefusedCall) Return(arg0 bool) *MockSentPacketHandlerAdmissionRefusedCall {
+	c.Call = c.Call.Return(arg0)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockSentPacketHandlerAdmissionRefusedCall) Do(f func() bool) *MockSentPacketHandlerAdmissionRefusedCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockSentPacketHandlerAdmissionRefusedCall) DoAndReturn(f func() bool) *MockSentPacketHandlerAdmissionRefusedCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
 // BytesInFlight mocks base method.
 func (m *MockSentPacketHandler) BytesInFlight() protocol.ByteCount {
 	m.ctrl.T.Helper()
@@ -260,42 +298,6 @@ func (c *MockSentPacketHandlerExpectGrantedPacketCall) Do(f func(uint64)) *MockS
 
 // DoAndReturn rewrite *gomock.Call.DoAndReturn
 func (c *MockSentPacketHandlerExpectGrantedPacketCall) DoAndReturn(f func(uint64)) *MockSentPacketHandlerExpectGrantedPacketCall {
-	c.Call = c.Call.DoAndReturn(f)
-	return c
-}
-
-// ExpectLivenessPing mocks base method.
-func (m *MockSentPacketHandler) ExpectLivenessPing() {
-	m.ctrl.T.Helper()
-	m.ctrl.Call(m, "ExpectLivenessPing")
-}
-
-// ExpectLivenessPing indicates an expected call of ExpectLivenessPing.
-func (mr *MockSentPacketHandlerMockRecorder) ExpectLivenessPing() *MockSentPacketHandlerExpectLivenessPingCall {
-	mr.mock.ctrl.T.Helper()
-	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ExpectLivenessPing", reflect.TypeOf((*MockSentPacketHandler)(nil).ExpectLivenessPing))
-	return &MockSentPacketHandlerExpectLivenessPingCall{Call: call}
-}
-
-// MockSentPacketHandlerExpectLivenessPingCall wrap *gomock.Call
-type MockSentPacketHandlerExpectLivenessPingCall struct {
-	*gomock.Call
-}
-
-// Return rewrite *gomock.Call.Return
-func (c *MockSentPacketHandlerExpectLivenessPingCall) Return() *MockSentPacketHandlerExpectLivenessPingCall {
-	c.Call = c.Call.Return()
-	return c
-}
-
-// Do rewrite *gomock.Call.Do
-func (c *MockSentPacketHandlerExpectLivenessPingCall) Do(f func()) *MockSentPacketHandlerExpectLivenessPingCall {
-	c.Call = c.Call.Do(f)
-	return c
-}
-
-// DoAndReturn rewrite *gomock.Call.DoAndReturn
-func (c *MockSentPacketHandlerExpectLivenessPingCall) DoAndReturn(f func()) *MockSentPacketHandlerExpectLivenessPingCall {
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }

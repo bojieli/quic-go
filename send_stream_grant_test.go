@@ -5,8 +5,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apernet/quic-go/congestion"
 	"github.com/apernet/quic-go/internal/ackhandler"
 	"github.com/apernet/quic-go/internal/protocol"
+	"github.com/apernet/quic-go/internal/wire"
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
@@ -82,4 +84,51 @@ func TestSendStreamGrantSplitsAStraddlingRetransmission(t *testing.T) {
 	rest, _, _ := str.popStreamFrame(1200, protocol.Version1)
 	require.Equal(t, protocol.ByteCount(0), rest.Frame.Offset)
 	require.Equal(t, protocol.ByteCount(40), rest.Frame.DataLen())
+}
+
+// A granted frame's size accounts for the real length field: a budget that
+// fits exactly one frame carrying the whole range carries all of it.
+func TestSendStreamGrantedFrameSizedByItsLengthField(t *testing.T) {
+	const streamID protocol.StreamID = 1000
+	mockCtrl := gomock.NewController(t)
+	mockFC := newTestStreamFlowControllerWithSendWindow(1<<20, protocol.MaxByteCount)
+	mockSender := NewMockStreamSender(mockCtrl)
+	str := newSendStream(context.Background(), streamID, mockSender, mockFC, false)
+	mockSender.EXPECT().onHasStreamData(streamID, str).AnyTimes()
+	_, err := (&writerWithTimeout{Writer: str, Timeout: time.Second}).Write(make([]byte, 100))
+	require.NoError(t, err)
+	exact := (&wire.StreamFrame{StreamID: streamID, DataLenPresent: true, Data: make([]byte, 100)}).Length(protocol.Version1)
+	f, _ := str.popGrantedStreamFrame(exact, 0, 100, protocol.Version1)
+	require.NotNil(t, f.Frame)
+	require.Equal(t, protocol.ByteCount(100), f.Frame.DataLen())
+}
+
+// A grant that sends offset zero still captures the prefix for
+// ProtectInitialPrefix; the redundant copies are left to the ordinary path.
+func TestSendStreamGrantCapturesTheProtectedPrefix(t *testing.T) {
+	const streamID protocol.StreamID = 1000
+	mockCtrl := gomock.NewController(t)
+	mockFC := newTestStreamFlowControllerWithSendWindow(1<<20, protocol.MaxByteCount)
+	mockSender := NewMockStreamSender(mockCtrl)
+	sendStr := newSendStream(context.Background(), streamID, mockSender, mockFC, false)
+	str := &Stream{sendStr: sendStr}
+	mockSender.EXPECT().onHasStreamData(streamID, sendStr).AnyTimes()
+	require.NotNil(t, str.ProtectInitialPrefix(64, 2))
+	_, err := (&writerWithTimeout{Writer: sendStr, Timeout: time.Second}).Write(make([]byte, 100))
+	require.NoError(t, err)
+	g := grantedFrame(sendStr, 0, 100)
+	require.NotNil(t, g.Frame)
+	require.Equal(t, protocol.ByteCount(0), g.Frame.Offset)
+	require.Nil(t, grantedFrame(sendStr, 0, 100).Frame, "no redundant copy under the grant")
+	copyFrame, _, _ := sendStr.popStreamFrame(1200, protocol.Version1)
+	require.NotNil(t, copyFrame.Frame, "the ordinary path offers the copy")
+	require.Equal(t, protocol.ByteCount(0), copyFrame.Frame.Offset)
+	require.Equal(t, protocol.ByteCount(64), copyFrame.Frame.DataLen())
+}
+
+func TestBindVerificationGrantRejectsANilStream(t *testing.T) {
+	c := &Conn{}
+	var typedNil *Stream
+	require.Error(t, c.BindVerificationGrant(nil, congestion.VerificationGrant{ID: 1, End: 1, Budget: 1}))
+	require.Error(t, c.BindVerificationGrant(typedNil, congestion.VerificationGrant{ID: 1, End: 1, Budget: 1}))
 }

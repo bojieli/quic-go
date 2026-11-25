@@ -19,3 +19,19 @@ type StreamFrame struct {
 	Frame   *wire.StreamFrame
 	Handler FrameHandler
 }
+
+// livenessPing marks the keep-alive PING, so the packet it is packed into is
+// recognised as carrying it. Its loss needs no retransmission: the PTO that
+// follows probes the path anyway.
+type livenessPing struct{}
+
+func (livenessPing) OnAcked(wire.Frame) {}
+func (livenessPing) OnLost(wire.Frame)  {}
+
+// LivenessPingHandler is the handler of a keep-alive PING frame.
+var LivenessPingHandler FrameHandler = livenessPing{}
+
+func isLivenessPing(f Frame) bool {
+	_, ok := f.Handler.(livenessPing)
+	return ok
+}

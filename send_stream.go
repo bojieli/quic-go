@@ -11,6 +11,7 @@ import (
 	"github.com/apernet/quic-go/internal/monotime"
 	"github.com/apernet/quic-go/internal/protocol"
 	"github.com/apernet/quic-go/internal/wire"
+	"github.com/apernet/quic-go/quicvarint"
 )
 
 // A SendStream is a unidirectional Send Stream.
@@ -342,11 +343,8 @@ func (s *SendStream) popStreamFrame(maxBytes protocol.ByteCount, v protocol.Vers
 	if f != nil {
 		s.numOutstandingFrames++
 	}
+	s.capturePrefix(f)
 	if repair := s.prefixRepair; repair != nil {
-		if f != nil && f.Offset == 0 && len(f.Data) > 0 && repair.data == nil {
-			// Capture only bytes the normal framer already charged to flow control.
-			repair.data = append([]byte(nil), f.Data[:min(repair.limit, len(f.Data))]...)
-		}
 		if len(repair.data) > 0 {
 			if f == nil {
 				// One visit per stream per packet. The regular packetizer and
@@ -539,9 +537,12 @@ func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCou
 	if s.shutdownErr != nil || s.resetErr != nil {
 		return ackhandler.StreamFrame{}, nil
 	}
+	// limit is the frame size that carries the range's remaining bytes from
+	// offset, with the length field sized for that many bytes.
 	limit := func(offset protocol.ByteCount) protocol.ByteCount {
-		header := (&wire.StreamFrame{StreamID: s.streamID, Offset: offset, DataLenPresent: true}).Length(v)
-		return min(maxBytes, header+end-offset)
+		n := end - offset
+		header := (&wire.StreamFrame{StreamID: s.streamID, Offset: offset, DataLenPresent: true}).Length(v) - 1 // without the length field
+		return min(maxBytes, header+protocol.ByteCount(quicvarint.Len(uint64(n)))+n)
 	}
 	for i, f := range s.retransmissionQueue {
 		if f.Offset >= end || f.Offset+f.DataLen() <= start {
@@ -591,6 +592,9 @@ func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCou
 	if f == nil {
 		return ackhandler.StreamFrame{}, blocked
 	}
+	// The prefix-repair capture happens here as on the ordinary path; its
+	// redundant copies are offered only by the ordinary builder.
+	s.capturePrefix(f)
 	s.numOutstandingFrames++
 	return ackhandler.StreamFrame{Frame: f, Handler: (*sendStreamAckHandler)(s)}, blocked
 }
@@ -624,6 +628,15 @@ func (s *SendStream) hasSendableData(connWindow bool) bool {
 		return s.finishedWriting && !s.finSent
 	}
 	return connWindow && s.flowController.SendWindowSize() > 0
+}
+
+// capturePrefix keeps a copy of the stream's first frame for
+// ProtectInitialPrefix. It must be called with the mutex held.
+func (s *SendStream) capturePrefix(f *wire.StreamFrame) {
+	if repair := s.prefixRepair; repair != nil && f != nil && f.Offset == 0 && len(f.Data) > 0 && repair.data == nil {
+		// Capture only bytes the normal framer already charged to flow control.
+		repair.data = append([]byte(nil), f.Data[:min(repair.limit, len(f.Data))]...)
+	}
 }
 
 // grantSendStream makes a SendStream a GrantableStream.

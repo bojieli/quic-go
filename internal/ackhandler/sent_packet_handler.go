@@ -109,10 +109,9 @@ type sentPacketHandler struct {
 	pathSender congestionExt.PathSender
 	// permit is the answer to the last Admit. It covers the next packet only.
 	permit congestionExt.Permit
-	// livenessPending says a keep-alive PING is queued; the next packet that
-	// carries a PING and nothing else ack-eliciting is labelled a liveness
-	// packet.
-	livenessPending bool
+	// admissionRefused says the last SendMode refused for the PathSender,
+	// not for a transport limit.
+	admissionRefused bool
 	// grantPending is the verification grant the next packet was built
 	// under, or zero.
 	grantPending uint64
@@ -1325,6 +1324,7 @@ func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
 // controller.
 func (h *sentPacketHandler) pathSenderSendMode(ps congestionExt.PathSender, now monotime.Time, numTrackedPackets int) SendMode {
 	h.permit = ps.Admit(now, congestionExt.ByteCount(h.maxDatagramSize))
+	h.admissionRefused = !h.permit.OK
 	if !h.permit.OK && h.permit.RetryAt.IsZero() {
 		if h.logger.Debug() {
 			h.logger.Debugf("Congestion limited: bytes in flight %d", h.bytesInFlight)
@@ -1333,6 +1333,7 @@ func (h *sentPacketHandler) pathSenderSendMode(ps congestionExt.PathSender, now 
 	}
 	if numTrackedPackets >= protocol.MaxOutstandingSentPackets {
 		h.permit = congestionExt.Permit{}
+		h.admissionRefused = false
 		if h.logger.Debug() {
 			h.logger.Debugf("Max outstanding limited: tracking %d packets, maximum: %d", numTrackedPackets, protocol.MaxOutstandingSentPackets)
 		}
@@ -1592,8 +1593,10 @@ func (h *sentPacketHandler) DetachPathSender(now monotime.Time) {
 	}
 }
 
-// ExpectLivenessPing says a keep-alive PING has been queued.
-func (h *sentPacketHandler) ExpectLivenessPing() { h.livenessPending = true }
+// AdmissionRefused says the last SendMode refused because the PathSender
+// refused admission. A transport limit (the outstanding-packet limit) is not
+// an admission refusal, and grants the exempt path no more than an ACK.
+func (h *sentPacketHandler) AdmissionRefused() bool { return h.admissionRefused }
 
 // ExpectGrantedPacket says the next packet was built under a verification
 // grant.
@@ -1645,13 +1648,15 @@ func (h *sentPacketHandler) packetKind(encLevel protocol.EncryptionLevel, p *pac
 		return congestionExt.KindPTOProbe
 	}
 	if len(p.StreamFrames) > 0 {
-		h.livenessPending = false
 		return congestionExt.KindOrdinary
 	}
-	onlyPing, pathValidation := true, false
+	onlyPing, pathValidation, liveness := true, false, false
 	for _, f := range p.Frames {
 		switch f.Frame.(type) {
 		case *wire.PingFrame:
+			// The keep-alive PING is recognised by its own marker, not by
+			// what was queued, so an unrelated PING is never mistaken for it.
+			liveness = liveness || isLivenessPing(f)
 		case *wire.PathChallengeFrame, *wire.PathResponseFrame:
 			pathValidation = true
 		default:
@@ -1659,17 +1664,15 @@ func (h *sentPacketHandler) packetKind(encLevel protocol.EncryptionLevel, p *pac
 		}
 	}
 	if !onlyPing {
-		h.livenessPending = false
 		return congestionExt.KindOrdinary
+	}
+	if liveness {
+		return congestionExt.KindLiveness
 	}
 	if pathValidation {
 		// A packet of path validation frames (and perhaps a PING) built
 		// on the current path. Unlike a probe packet it is in flight.
 		return congestionExt.KindPathProbe
-	}
-	if h.livenessPending {
-		h.livenessPending = false
-		return congestionExt.KindLiveness
 	}
 	if p.LargestAcked != protocol.InvalidPacketNumber {
 		return congestionExt.KindAckPing
@@ -1688,7 +1691,7 @@ func (h *sentPacketHandler) sentPacketInfo(t monotime.Time, encLevel protocol.En
 		Bytes:           congestionExt.ByteCount(p.Length),
 		AckEliciting:    p.IsAckEliciting(),
 		InFlightCounted: p.includedInBytesInFlight,
-		Exempt:          exempt || kind == congestionExt.KindPathProbe,
+		Exempt:          exempt, // the build path actually used
 		Kind:            kind,
 		InFlight:        congestionExt.ByteCount(h.bytesInFlight),
 		Time:            t,

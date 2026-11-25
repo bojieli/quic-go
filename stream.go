@@ -253,4 +253,9 @@ func (s *Stream) checkIfCompleted() {
 }
 
 // grantSendStream makes a Stream a GrantableStream.
-func (s *Stream) grantSendStream() *SendStream { return s.sendStr }
+func (s *Stream) grantSendStream() *SendStream {
+	if s == nil {
+		return nil
+	}
+	return s.sendStr
+}

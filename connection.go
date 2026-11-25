@@ -732,8 +732,7 @@ runLoop:
 			if c.pathSender != nil {
 				// The PING is an exempt obligation: it can be sent while the
 				// connection is window-blocked or paced.
-				c.framer.QueueExemptFrame(&wire.PingFrame{})
-				c.sentPacketHandler.ExpectLivenessPing()
+				c.framer.QueueExemptFrame(ackhandler.Frame{Frame: &wire.PingFrame{}, Handler: ackhandler.LivenessPingHandler})
 			} else {
 				c.framer.QueueControlFrame(&wire.PingFrame{})
 			}
@@ -2677,7 +2676,7 @@ func (c *Conn) triggerSending(now monotime.Time) error {
 		// There will only be a new ACK after receiving new packets.
 		// SendAck is only returned when we're congestion limited, so we don't need to set the pacing timer.
 		c.blocked = blockModeCongestionLimited
-		if c.pathSender != nil {
+		if c.pathSender != nil && c.sentPacketHandler.AdmissionRefused() {
 			return c.maybeSendExemptPacket(now)
 		}
 		return c.maybeSendAckOnlyPacket(now)
@@ -2805,6 +2804,9 @@ func (c *Conn) BindVerificationGrant(str GrantableStream, g congestion.Verificat
 	if g.ID == 0 || g.End <= g.Start || g.Budget <= 0 {
 		return errors.New("invalid verification grant")
 	}
+	if str == nil {
+		return errors.New("verification grant needs a send stream")
+	}
 	s := str.grantSendStream()
 	if s == nil {
 		return errors.New("verification grant needs a send stream")
@@ -2833,7 +2835,7 @@ func (c *Conn) BindVerificationGrant(str GrantableStream, g congestion.Verificat
 // control is not consulted.
 func (c *Conn) updateDemand() {
 	var d congestion.Demand
-	d.Eligible[congestion.ClassExempt] = c.framer.HasExemptData()
+	d.Eligible[congestion.ClassExempt] = c.framer.HasExemptData() || c.receivedPacketHandler.HasAckDue(monotime.Now())
 	d.Eligible[congestion.ClassControl] = c.framer.HasControlData() ||
 		c.retransmissionQueue.HasData(protocol.Encryption1RTT) ||
 		c.connFlowController.HasWindowUpdate() ||

@@ -158,11 +158,20 @@ func TestPathSenderSentPacketsAreClassifiedAsBuilt(t *testing.T) {
 	require.Equal(t, congestion.KindAckPing, ps.lastSent().Kind)
 	require.True(t, ps.lastSent().AckEliciting)
 
-	// A queued keep-alive PING is a liveness packet.
-	sph.ExpectLivenessPing()
+	// The keep-alive PING is recognised by its marker.
 	pn = sph.PopPacketNumber(protocol.Encryption1RTT)
-	sph.SentPacket(now, pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.Encryption1RTT, protocol.ECNNon, 30, false, false)
+	sph.SentPacket(now, pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}, Handler: LivenessPingHandler}}, protocol.Encryption1RTT, protocol.ECNNon, 30, false, false)
 	require.Equal(t, congestion.KindLiveness, ps.lastSent().Kind)
+	// An unrelated PING on an ACK is ACK_PING, whatever was sent before.
+	pn = sph.PopPacketNumber(protocol.Encryption1RTT)
+	sph.SentPacket(now, pn, 3, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.Encryption1RTT, protocol.ECNNon, 51, false, false)
+	require.Equal(t, congestion.KindAckPing, ps.lastSent().Kind)
+	// A PATH_RESPONSE built under a permit reports the permit.
+	require.Equal(t, SendAny, sph.SendMode(now))
+	pn = sph.PopPacketNumber(protocol.Encryption1RTT)
+	sph.SentPacket(now, pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PathResponseFrame{}}}, protocol.Encryption1RTT, protocol.ECNNon, 40, false, false)
+	require.Equal(t, congestion.KindPathProbe, ps.lastSent().Kind)
+	require.False(t, ps.lastSent().Exempt, "it was built under a permit")
 
 	// A packet built under a permit is ordinary and not exempt.
 	require.Equal(t, SendAny, sph.SendMode(now))
@@ -409,4 +418,23 @@ func TestLateAcknowledgementIsProgressAndScopedCorrection(t *testing.T) {
 			require.Empty(t, ps.acks)
 		}
 	}
+}
+
+// At the outstanding-packet limit the handler refuses with SendAck, but that
+// is a transport limit, not an admission refusal: the exempt path may then
+// send no more than an ACK.
+func TestPathSenderOutstandingLimitIsNotAnAdmissionRefusal(t *testing.T) {
+	ps := newRecordingPathSender()
+	sph := newPathSenderHandler(t, ps, protocol.PerspectiveClient)
+	now := monotime.Now()
+	ps.admit = congestion.Permit{}
+	require.Equal(t, SendAck, sph.SendMode(now))
+	require.True(t, sph.AdmissionRefused())
+	ps.admit = congestion.Permit{OK: true, MaxBytes: 1200}
+	for range protocol.MaxOutstandingSentPackets {
+		pn := sph.PopPacketNumber(protocol.Encryption1RTT)
+		sph.SentPacket(now, pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.Encryption1RTT, protocol.ECNNon, 30, false, false)
+	}
+	require.Equal(t, SendAck, sph.SendMode(now))
+	require.False(t, sph.AdmissionRefused(), "the outstanding-packet limit is a transport limit")
 }

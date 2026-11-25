@@ -48,8 +48,9 @@ type SentPacketHandler interface {
 	InstallPathSender(ps congestion.PathSender, now monotime.Time, wake func())
 	// DetachPathSender detaches an installed PathSender.
 	DetachPathSender(now monotime.Time)
-	// ExpectLivenessPing says a keep-alive PING has been queued.
-	ExpectLivenessPing()
+	// AdmissionRefused says the last SendMode refused because the PathSender
+	// refused admission, not because of a transport limit.
+	AdmissionRefused() bool
 	// ExpectGrantedPacket says the next packet registered was built under the
 	// verification grant with this ID.
 	ExpectGrantedPacket(id uint64)

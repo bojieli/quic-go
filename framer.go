@@ -40,7 +40,7 @@ type framer struct {
 	controlFrames     []wire.Frame
 	// exemptFrames are obligations that may be sent without a permit, such
 	// as a liveness PING. They are also packed into ordinary packets.
-	exemptFrames               []wire.Frame
+	exemptFrames               []ackhandler.Frame
 	pathResponses              []*wire.PathResponseFrame
 	connFlowController         *connectionFlowController
 	queuedTooManyControlFrames bool
@@ -66,8 +66,9 @@ func (f *framer) HasData() bool {
 	return len(f.streamsWithControlFrames) > 0 || len(f.controlFrames) > 0 || len(f.pathResponses) > 0 || len(f.exemptFrames) > 0
 }
 
-// QueueExemptFrame queues a frame that may be sent without a permit.
-func (f *framer) QueueExemptFrame(frame wire.Frame) {
+// QueueExemptFrame queues a frame that may be sent without a permit. Its
+// handler, if any, is kept.
+func (f *framer) QueueExemptFrame(frame ackhandler.Frame) {
 	f.controlFrameMutex.Lock()
 	defer f.controlFrameMutex.Unlock()
 	if len(f.exemptFrames) >= maxPathResponses {
@@ -130,11 +131,11 @@ func (f *framer) appendExemptFrames(frames []ackhandler.Frame, maxLen protocol.B
 	}
 	for len(f.exemptFrames) > 0 {
 		frame := f.exemptFrames[len(f.exemptFrames)-1]
-		frameLen := frame.Length(v)
+		frameLen := frame.Frame.Length(v)
 		if length+frameLen > maxLen {
 			break
 		}
-		frames = append(frames, ackhandler.Frame{Frame: frame})
+		frames = append(frames, frame)
 		length += frameLen
 		f.exemptFrames = f.exemptFrames[:len(f.exemptFrames)-1]
 	}
