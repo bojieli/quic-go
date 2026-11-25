@@ -370,11 +370,13 @@ func (h *sentPacketHandler) SentPacket(
 	cc, ps := h.getControllers()
 	// A permit covers exactly one packet. It is only used, and only touched,
 	// on the run loop while a PathSender is installed.
-	// In a coalesced datagram the permit belongs to the application packet.
+	// A permit covers the build that follows the Admit that issued it --
+	// every packet of a coalesced datagram, handshake-only builds included --
+	// and is withdrawn by the next SendMode. Each packet of a batch is
+	// preceded by its own SendMode.
 	var underPermit bool
-	if ps != nil && (encLevel == protocol.Encryption1RTT || encLevel == protocol.Encryption0RTT) {
+	if ps != nil {
 		underPermit = h.permit.OK
-		h.permit = congestionExt.Permit{}
 	}
 
 	if isPathProbePacket {
@@ -1324,18 +1326,21 @@ func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
 // controller.
 func (h *sentPacketHandler) pathSenderSendMode(ps congestionExt.PathSender, now monotime.Time, numTrackedPackets int) SendMode {
 	h.permit = ps.Admit(now, congestionExt.ByteCount(h.maxDatagramSize))
-	h.admissionRefused = !h.permit.OK
-	if !h.permit.OK && h.permit.RetryAt.IsZero() {
-		if h.logger.Debug() {
-			h.logger.Debugf("Congestion limited: bytes in flight %d", h.bytesInFlight)
-		}
-		return SendAck
-	}
+	// The transport's outstanding-packet limit comes first: whatever the
+	// controller answered, only an ACK may go, and no exempt obligation or
+	// grant may spend the headroom kept for ACKs.
 	if numTrackedPackets >= protocol.MaxOutstandingSentPackets {
 		h.permit = congestionExt.Permit{}
 		h.admissionRefused = false
 		if h.logger.Debug() {
 			h.logger.Debugf("Max outstanding limited: tracking %d packets, maximum: %d", numTrackedPackets, protocol.MaxOutstandingSentPackets)
+		}
+		return SendAck
+	}
+	h.admissionRefused = !h.permit.OK
+	if !h.permit.OK && h.permit.RetryAt.IsZero() {
+		if h.logger.Debug() {
+			h.logger.Debugf("Congestion limited: bytes in flight %d", h.bytesInFlight)
 		}
 		return SendAck
 	}
@@ -1482,6 +1487,10 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 		if !p.isPathProbePacket {
 			if ps != nil && p.includedInBytesInFlight {
 				h.discardRefs = append(h.discardRefs, packetRef(protocol.Encryption1RTT, pn, p.Length))
+			}
+			if p.IsAckEliciting() {
+				// A late acknowledgement is still progress, not a correction.
+				h.recordLateAck(lostRecord{pn: pn, size: p.Length, sent: p.SendTime})
 			}
 			h.removeFromBytesInFlight(p)
 			if p.IsAckEliciting() {

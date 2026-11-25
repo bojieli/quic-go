@@ -132,3 +132,15 @@ func TestBindVerificationGrantRejectsANilStream(t *testing.T) {
 	require.Error(t, c.BindVerificationGrant(nil, congestion.VerificationGrant{ID: 1, End: 1, Budget: 1}))
 	require.Error(t, c.BindVerificationGrant(typedNil, congestion.VerificationGrant{ID: 1, End: 1, Budget: 1}))
 }
+
+func TestBindVerificationGrantRejectsOffsetsOutsideTheStream(t *testing.T) {
+	c := &Conn{}
+	str := &SendStream{sender: c}
+	for _, g := range []congestion.VerificationGrant{
+		{ID: 1, Start: -1, End: 10, Budget: 1000},
+		{ID: 1, Start: 0, End: congestion.ByteCount(protocol.MaxByteCount) + 1, Budget: 1000},
+		{ID: 1, Start: 5, End: 5, Budget: 1000},
+	} {
+		require.Error(t, c.BindVerificationGrant(str, g), "%+v", g)
+	}
+}

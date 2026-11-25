@@ -2801,7 +2801,7 @@ type GrantableStream interface{ grantSendStream() *SendStream }
 // grant's ID. Binding another grant replaces this one. It has no effect
 // without a PathSender, and changes nothing on the wire.
 func (c *Conn) BindVerificationGrant(str GrantableStream, g congestion.VerificationGrant) error {
-	if g.ID == 0 || g.End <= g.Start || g.Budget <= 0 {
+	if g.ID == 0 || g.Start < 0 || g.End <= g.Start || g.End > congestion.ByteCount(protocol.MaxByteCount) || g.Budget <= 0 {
 		return errors.New("invalid verification grant")
 	}
 	if str == nil {
@@ -2836,6 +2836,11 @@ func (c *Conn) BindVerificationGrant(str GrantableStream, g congestion.Verificat
 func (c *Conn) updateDemand() {
 	var d congestion.Demand
 	d.Eligible[congestion.ClassExempt] = c.framer.HasExemptData() || c.receivedPacketHandler.HasAckDue(monotime.Now())
+	if !d.Eligible[congestion.ClassExempt] && c.perspective == protocol.PerspectiveClient && c.handshakeConfirmed {
+		if pm := c.pathManagerOutgoing.Load(); pm != nil && pm.HasPathToProbe() {
+			d.Eligible[congestion.ClassExempt] = true
+		}
+	}
 	d.Eligible[congestion.ClassControl] = c.framer.HasControlData() ||
 		c.retransmissionQueue.HasData(protocol.Encryption1RTT) ||
 		c.connFlowController.HasWindowUpdate() ||

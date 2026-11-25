@@ -231,6 +231,19 @@ func (pm *pathManagerOutgoing) NewPath(t *Transport, initialRTT time.Duration, e
 	}
 }
 
+// HasPathToProbe says, without consuming anything, whether a path is waiting
+// for a PATH_CHALLENGE.
+func (pm *pathManagerOutgoing) HasPathToProbe() bool {
+	pm.mx.Lock()
+	defer pm.mx.Unlock()
+	for _, pID := range pm.pathsToProbe {
+		if _, ok := pm.paths[pID]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 func (pm *pathManagerOutgoing) NextPathToProbe() (_ protocol.ConnectionID, _ ackhandler.Frame, _ *Transport, hasPath bool) {
 	pm.mx.Lock()
 	defer pm.mx.Unlock()

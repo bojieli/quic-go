@@ -188,7 +188,10 @@ func TestPathSenderSentPacketsAreClassifiedAsBuilt(t *testing.T) {
 		total += n
 	}
 	require.Equal(t, congestion.ByteCount(1000), total, "every byte is charged to a class")
-	// The permit covered one packet only.
+	// The permit covers that build only: the next SendMode withdraws it.
+	ps.admit = congestion.Permit{}
+	require.Equal(t, SendAck, sph.SendMode(now))
+	ps.admit = congestion.Permit{OK: true, MaxBytes: 1200}
 	pn = sph.PopPacketNumber(protocol.Encryption1RTT)
 	sph.SentPacket(now, pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.Encryption1RTT, protocol.ECNNon, 30, false, false)
 	require.True(t, ps.lastSent().Exempt)
@@ -437,4 +440,11 @@ func TestPathSenderOutstandingLimitIsNotAnAdmissionRefusal(t *testing.T) {
 	}
 	require.Equal(t, SendAck, sph.SendMode(now))
 	require.False(t, sph.AdmissionRefused(), "the outstanding-packet limit is a transport limit")
+	// The limit comes first even when the controller refuses too.
+	ps.admit = congestion.Permit{}
+	require.Equal(t, SendAck, sph.SendMode(now))
+	require.False(t, sph.AdmissionRefused())
+	ps.admit = congestion.Permit{RetryAt: now.Add(time.Millisecond)}
+	require.Equal(t, SendAck, sph.SendMode(now))
+	require.False(t, sph.AdmissionRefused())
 }
