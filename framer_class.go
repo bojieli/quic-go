@@ -76,15 +76,41 @@ func (f *framer) SetClassed(on bool) {
 		}
 	}
 	clear(f.ringOf)
+	f.liveIn = [congestion.NumSendClasses]int{}
 }
 
 // file makes a new live entry for a stream in class's ring. It must be called
 // with the mutex held.
 func (f *framer) file(id protocol.StreamID, class congestion.SendClass) {
+	f.unfile(id)
 	f.ringGen++
 	e := ringEntry{id: id, class: class, gen: f.ringGen}
 	f.ringOf[id] = e
+	f.liveIn[class]++
 	f.classRings[class].PushBack(e)
+}
+
+// unfile makes a stream's live entry stale, and compacts its ring when stale
+// entries outnumber live ones: a ring whose class gets no turns would
+// otherwise keep every entry that moved away from it. It must be called with
+// the mutex held.
+func (f *framer) unfile(id protocol.StreamID) {
+	old, ok := f.ringOf[id]
+	if !ok {
+		return
+	}
+	delete(f.ringOf, id)
+	f.liveIn[old.class]--
+	ring := &f.classRings[old.class]
+	if f.serving || ring.Len() <= 2*f.liveIn[old.class]+32 {
+		return
+	}
+	for range ring.Len() {
+		e := ring.PopFront()
+		if f.live(e) {
+			ring.PushBack(e)
+		}
+	}
 }
 
 // live says whether a ring entry is its stream's current one. It must be
@@ -219,6 +245,8 @@ func (f *framer) appendClassStreams(
 	v protocol.Version,
 ) (_ []ackhandler.Frame, _ []ackhandler.StreamFrame, length protocol.ByteCount, sentStream bool) {
 	ring := &f.classRings[class]
+	f.serving = true
+	defer func() { f.serving = false }()
 	for range ring.Len() {
 		remaining := maxLen - length
 		if remaining < minClassedStreamFrame {
@@ -230,9 +258,12 @@ func (f *framer) appendClassStreams(
 		}
 		str := f.activeStreams[e.id]
 		popLen := remaining
-		if last {
+		if last && remaining >= protocol.MinStreamFrameSize {
 			// As in getNextStreamFrame: the length field of the packet's
-			// last STREAM frame is removed later.
+			// last STREAM frame is removed later. With at least 128 bytes a
+			// frame that fills the space has a length field as long as the
+			// one borrowed, so removing it brings the frame within remaining;
+			// below that a shorter field could leave it a byte over.
 			popLen += protocol.ByteCount(quicvarint.Len(uint64(remaining)))
 		}
 		var (
@@ -255,8 +286,8 @@ func (f *framer) appendClassStreams(
 		if hasMore {
 			f.file(e.id, next)
 		} else {
+			f.unfile(e.id)
 			delete(f.activeStreams, e.id)
-			delete(f.ringOf, e.id)
 		}
 		if sf.Frame != nil {
 			streamFrames = append(streamFrames, sf)

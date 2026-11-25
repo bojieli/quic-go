@@ -623,10 +623,25 @@ func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCou
 	// New data only: retransmissions outside the range stay queued.
 	queued := s.retransmissionQueue
 	s.retransmissionQueue = nil
+	var class congestion.SendClass
+	if s.classTagged {
+		// The frame carries its class, for its retransmissions, and does
+		// not mix classes.
+		var end protocol.ByteCount
+		class, end = s.newDataClass()
+		if end != noClassLimit && end > s.writeOffset {
+			s.classLimit = end - s.writeOffset
+		}
+	}
 	f, blocked, _ := s.popNewOrRetransmittedStreamFrame(limit(s.writeOffset), v)
+	s.classLimit = 0
 	s.retransmissionQueue = queued
 	if f == nil {
 		return ackhandler.StreamFrame{}, blocked
+	}
+	if s.classTagged {
+		f.Class = uint8(class)
+		s.pruneClassSegs()
 	}
 	// The prefix-repair capture happens here as on the ordinary path; its
 	// redundant copies are offered only by the ordinary builder.

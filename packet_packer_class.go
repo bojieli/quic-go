@@ -25,6 +25,11 @@ var classOrder = [...]congestion.SendClass{congestion.ClassControl, congestion.C
 // smaller than this builds nothing: it is the scheduler's to size.
 const minClassedPayload protocol.ByteCount = 64
 
+// maxAppPacketOverhead bounds an application packet's header and AEAD tag:
+// a 0-RTT long header with two maximum-length connection IDs, a two-byte
+// length and a four-byte packet number, and a 16-byte tag.
+const maxAppPacketOverhead protocol.ByteCount = 1 + 4 + 1 + 20 + 1 + 20 + 2 + 4 + 16
+
 // currentClassPermit returns the permit the next packet is built under, if
 // the connection schedules classes and holds a permit. A permit of zero bytes
 // is returned too: it builds nothing, rather than an unrestricted packet.
@@ -171,6 +176,16 @@ func (p *packetPacker) appendClassedDatagram(pl *payload, limit, maxPayloadSize,
 		return 0
 	}
 	f := p.datagramQueue.Peek()
+	for f != nil && fullPayload > 0 && f.Length(v) > fullPayload {
+		// It would not fit a packet that carried nothing else; the next
+		// one may.
+		if p.datagramQueue.logger != nil && p.datagramQueue.logger.Debug() {
+			p.datagramQueue.logger.Debugf("Discarded DATAGRAM frame (%d bytes payload)", f.Length(v))
+		}
+		p.datagramQueue.PopDiscarded()
+		p.peekTimes = 0
+		f = p.datagramQueue.Peek()
+	}
 	if f == nil {
 		return 0
 	}
@@ -182,15 +197,6 @@ func (p *packetPacker) appendClassedDatagram(pl *payload, limit, maxPayloadSize,
 		return size
 	}
 	if fullPayload == 0 {
-		return 0
-	}
-	if size > fullPayload {
-		// It would not fit a packet that carried nothing else.
-		if p.datagramQueue.logger != nil && p.datagramQueue.logger.Debug() {
-			p.datagramQueue.logger.Debugf("Discarded DATAGRAM frame (%d bytes payload)", size)
-		}
-		p.datagramQueue.PopDiscarded()
-		p.peekTimes = 0
 		return 0
 	}
 	if !turn || maxPayloadSize < fullPayload || size <= maxPayloadSize-pl.length {

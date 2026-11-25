@@ -379,3 +379,46 @@ func TestClassedFramerServesARefiledStreamOncePerRound(t *testing.T) {
 	}
 	require.Equal(t, map[protocol.StreamID]int{4: 1, 8: 1}, served, "one turn each per round")
 }
+
+// An oversized DATAGRAM at the head is discarded and the one behind it goes
+// in the same packet, so it does not wait for an unrelated wake-up.
+func TestClassedBuilderSendsTheDatagramBehindADiscardedOne(t *testing.T) {
+	h := newBuilderHarness(true)
+	h.datagram(int(testPayload), 1)
+	h.datagram(100, 2)
+	pl := h.packer.composeClassedPacket(testPayload, testPayload, congestion.Permit{OK: true, Turn: congestion.ClassInteractive, MaxBytes: 1252}, true, monotime.Now(), protocol.Version1)
+	require.Len(t, pl.frames, 1)
+	require.Equal(t, byte(2), pl.frames[0].Frame.(*wire.DatagramFrame).Data[0])
+}
+
+// At every small payload the last STREAM frame, length field removed, fits.
+func TestClassedBuilderLastFrameFitsAtVarintBoundaries(t *testing.T) {
+	for size := minClassedPayload; size <= 200; size++ {
+		h := newBuilderHarness(true)
+		str := h.stream(4)
+		writeClassBuffered(t, str, 1000, congestion.ClassBulk)
+		pl := h.packer.composeClassedPacket(size, testPayload, congestion.Permit{OK: true, Turn: congestion.ClassBulk, MaxBytes: 1252}, true, monotime.Now(), protocol.Version1)
+		require.LessOrEqual(t, pl.length, size, "payload %d", size)
+		var wireLen protocol.ByteCount
+		for _, f := range pl.streamFrames {
+			wireLen += f.Frame.Length(protocol.Version1)
+		}
+		require.Equal(t, wireLen, pl.length)
+	}
+}
+
+// Stale entries of a ring whose class gets no turns are reclaimed.
+func TestClassedFramerCompactsStaleEntries(t *testing.T) {
+	h := newBuilderHarness(true)
+	for i := range 500 {
+		s := &fakeClassedStream{id: protocol.StreamID(4 * (i + 1)), class: congestion.ClassBulk}
+		h.framer.AddActiveStream(s.id, s)
+		s.class = congestion.ClassControl
+		h.framer.AddActiveStream(s.id, s)
+		h.framer.RemoveActiveStream(s.id)
+	}
+	h.framer.mutex.Lock()
+	defer h.framer.mutex.Unlock()
+	require.LessOrEqual(t, h.framer.classRings[congestion.ClassBulk].Len(), 64)
+	require.LessOrEqual(t, h.framer.classRings[congestion.ClassControl].Len(), 64)
+}

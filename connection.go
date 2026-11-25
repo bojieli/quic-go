@@ -1032,7 +1032,15 @@ func (c *Conn) applyPendingSettings(now monotime.Time) {
 		c.sentPacketHandler.SetCongestionControl(cc)
 		c.pathSender = nil
 	}
-	c.setClassed(isPathSender && ackhandler.SchedulesClasses(ps))
+	// The mode the handler sampled at installation, so builder and handler
+	// agree.
+	var classed bool
+	if ph, ok := c.sentPacketHandler.(interface {
+		Permit() (congestion.Permit, bool)
+	}); ok && isPathSender {
+		_, classed = ph.Permit()
+	}
+	c.setClassed(classed)
 	c.pathSenderMx.Lock()
 	c.hasPathSender.Store(isPathSender)
 	if c.pendingController == nil {

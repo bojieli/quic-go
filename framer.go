@@ -45,6 +45,8 @@ type framer struct {
 	classed    bool
 	classRings [congestion.NumSendClasses]ringbuffer.RingBuffer[ringEntry]
 	ringOf     map[protocol.StreamID]ringEntry
+	liveIn     [congestion.NumSendClasses]int
+	serving    bool // a ring is being served; no compaction meanwhile
 	ringGen    uint64
 
 	controlFrameMutex sync.Mutex
@@ -339,8 +341,10 @@ func (f *framer) AddStreamWithControlFrames(id protocol.StreamID, str streamCont
 // RemoveActiveStream is called when a stream completes.
 func (f *framer) RemoveActiveStream(id protocol.StreamID) {
 	f.mutex.Lock()
+	if f.classed {
+		f.unfile(id)
+	}
 	delete(f.activeStreams, id)
-	delete(f.ringOf, id)
 	// We don't delete the stream from the streamQueue,
 	// since we'd have to iterate over the ringbuffer.
 	// Instead, we check if the stream is still in activeStreams when appending STREAM frames.
@@ -386,6 +390,7 @@ func (f *framer) Handle0RTTRejection() {
 		f.classRings[i].Clear()
 	}
 	clear(f.ringOf)
+	f.liveIn = [congestion.NumSendClasses]int{}
 	clear(f.streamsWithControlFrames)
 	var j int
 	for i, frame := range f.controlFrames {

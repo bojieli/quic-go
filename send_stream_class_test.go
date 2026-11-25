@@ -123,3 +123,17 @@ func TestSendStreamUnclassedKeepsNoClassState(t *testing.T) {
 	f, _, _ := str.popStreamFrame(1200, protocol.Version1)
 	require.Zero(t, f.Frame.Class)
 }
+
+// New bytes sent under a verification grant carry their class, so a
+// retransmission keeps it.
+func TestGrantedFramesCarryTheirClass(t *testing.T) {
+	str := newClassTestStream(t, 16)
+	writeClassBuffered(t, str, 100, congestion.ClassInteractive)
+	writeClassBuffered(t, str, 100, congestion.ClassBulk)
+	f, _ := str.popGrantedStreamFrame(1200, 0, 1000, protocol.Version1)
+	require.NotNil(t, f.Frame)
+	require.Equal(t, protocol.ByteCount(100), f.Frame.DataLen(), "a granted frame does not mix classes")
+	require.Equal(t, uint8(congestion.ClassInteractive), f.Frame.Class)
+	f.Handler.OnLost(f.Frame)
+	require.Equal(t, congestion.ClassInteractive, str.streamClass())
+}

@@ -761,10 +761,11 @@ func (p *packetPacker) maybeGetAppDataPacket(
 	if permit, ok := p.currentClassPermit(onlyAck); ok {
 		// Application data in a coalesced packet before the handshake is
 		// confirmed: the permit's classes apply to it too, and MaxBytes
-		// bounds its payload (the coalesced datagram keeps the padding the
-		// handshake needs). Its datagram limit is not known here, so no
+		// bounds it with the largest header and sealing overhead a 0-RTT or
+		// 1-RTT packet can have (the coalesced datagram keeps the padding
+		// the handshake needs). Its datagram limit is not known here, so no
 		// DATAGRAM is discarded for size.
-		return p.maybeGetClassedPacket(min(maxPayloadSize, protocol.ByteCount(permit.MaxBytes)), 0, permit, ackAllowed, now, v)
+		return p.maybeGetClassedPacket(min(maxPayloadSize, protocol.ByteCount(permit.MaxBytes)-maxAppPacketOverhead), 0, permit, ackAllowed, now, v)
 	}
 	pl := p.composeNextPacket(maxPayloadSize, onlyAck, ackAllowed, now, v)
 
