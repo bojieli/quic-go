@@ -448,3 +448,61 @@ func TestPathSenderOutstandingLimitIsNotAnAdmissionRefusal(t *testing.T) {
 	require.Equal(t, SendAck, sph.SendMode(now))
 	require.False(t, sph.AdmissionRefused())
 }
+
+// A spurious loss takes back what the transport counted for it: PacketsLost
+// and BytesLost fall again when a packet declared lost is acknowledged.
+func TestSpuriousLossIsTakenBackFromTheLossCounters(t *testing.T) {
+	stats := &utils.ConnectionStats{}
+	sph := NewSentPacketHandler(0, 1200, utils.NewRTTStats(), stats, true, false, nil, protocol.PerspectiveClient, false, nil, utils.DefaultLogger).(*sentPacketHandler)
+	sph.InstallPathSender(newRecordingPathSender(), monotime.Now(), func() {})
+	var tr packetTracker
+	start := monotime.Now()
+	var pns []protocol.PacketNumber
+	for i := range 5 {
+		pns = append(pns, sendPing(sph, &tr, start.Add(time.Duration(i)*time.Millisecond), protocol.Encryption1RTT, 1000))
+	}
+	now := start.Add(50 * time.Millisecond)
+	_, err := sph.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(pns[4])}, protocol.Encryption1RTT, now)
+	require.NoError(t, err)
+	lost := stats.PacketsLost.Load()
+	require.Positive(t, lost)
+	require.Equal(t, lost*1000, stats.BytesLost.Load())
+	_, err = sph.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(pns[0], pns[4])}, protocol.Encryption1RTT, now.Add(time.Millisecond))
+	require.NoError(t, err)
+	require.Equal(t, lost-1, stats.PacketsLost.Load(), "the spurious loss was not taken back")
+	require.Equal(t, (lost-1)*1000, stats.BytesLost.Load())
+}
+
+type classedRecordingPathSender struct{ *recordingPathSender }
+
+func (classedRecordingPathSender) SchedulesClasses() bool { return true }
+
+// Under a class scheduler, bytes are reported by the class they were served
+// at, and a packet's overhead is its turn's, even when only a fill class found
+// room in it. Without one, frames are classed by type as before.
+func TestClassedPacketBytesAreReportedByServedClass(t *testing.T) {
+	for _, classed := range []bool{false, true} {
+		rec := newRecordingPathSender()
+		var ps congestion.PathSender = rec
+		if classed {
+			ps = classedRecordingPathSender{rec}
+		}
+		sph := NewSentPacketHandler(0, 1200, utils.NewRTTStats(), &utils.ConnectionStats{}, true, false, nil, protocol.PerspectiveClient, false, nil, utils.DefaultLogger).(*sentPacketHandler)
+		sph.InstallPathSender(ps, monotime.Now(), func() {})
+		rec.admit = congestion.Permit{OK: true, Turn: congestion.ClassInteractive, MaxBytes: 1200,
+			Fill: [congestion.NumSendClasses]congestion.ByteCount{congestion.ClassControl: 500}}
+		require.Equal(t, SendAny, sph.SendMode(monotime.Now()))
+		control := &wire.StreamFrame{StreamID: 4, Data: make([]byte, 100), Class: uint8(congestion.ClassControl)}
+		pn := sph.PopPacketNumber(protocol.Encryption1RTT)
+		sph.SentPacket(monotime.Now(), pn, protocol.InvalidPacketNumber, []StreamFrame{{Frame: control}}, nil, protocol.Encryption1RTT, protocol.ECNNon, 150, false, false)
+		got := rec.sent[len(rec.sent)-1].ClassBytes
+		frame := congestion.ByteCount(control.Length(protocol.Version1))
+		if classed {
+			require.Equal(t, frame, got[congestion.ClassControl])
+			require.Equal(t, 150-frame, got[congestion.ClassInteractive], "the overhead is the turn's")
+			require.Zero(t, got[congestion.ClassBulk])
+		} else {
+			require.Equal(t, congestion.ByteCount(150), got[congestion.ClassBulk], "without a class scheduler stream bytes are BULK, as before")
+		}
+	}
+}

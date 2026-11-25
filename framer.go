@@ -40,11 +40,12 @@ type framer struct {
 	// classed is set while the connection's PathSender schedules classes.
 	// Active streams are then queued in classRings by effective class
 	// instead of in streamQueue, round-robin within a class. ringOf is the
-	// ring each active stream is filed in; an entry in another ring is stale
-	// and skipped. See framer_class.go.
+	// one live entry of each filed stream; any other entry is stale and
+	// skipped. See framer_class.go.
 	classed    bool
-	classRings [congestion.NumSendClasses]ringbuffer.RingBuffer[protocol.StreamID]
-	ringOf     map[protocol.StreamID]congestion.SendClass
+	classRings [congestion.NumSendClasses]ringbuffer.RingBuffer[ringEntry]
+	ringOf     map[protocol.StreamID]ringEntry
+	ringGen    uint64
 
 	controlFrameMutex sync.Mutex
 	controlFrames     []wire.Frame
@@ -188,6 +189,11 @@ func (f *framer) Append(
 	var lastFrame ackhandler.StreamFrame
 	var streamFrameLen protocol.ByteCount
 	f.mutex.Lock()
+	if f.classed {
+		// A build outside class scheduling's own (a PTO probe) takes the
+		// classes in priority order.
+		return f.appendAllClasses(frames, streamFrames, controlFrameLen, maxLen, v)
+	}
 	// pop STREAM frames, until less than 128 bytes are left in the packet
 	numActiveStreams := f.streamQueue.Len()
 	for range numActiveStreams {
@@ -250,7 +256,18 @@ func (f *framer) appendControlFrames(
 ) ([]ackhandler.Frame, protocol.ByteCount) {
 	// add a PATH_RESPONSE first, but only pack a single PATH_RESPONSE per packet
 	frames, length := f.appendExemptFrames(frames, maxLen, v)
+	return f.appendOrdinaryControlFrames(frames, length, maxLen, now, v)
+}
 
+// appendOrdinaryControlFrames appends the queued control frames that are not
+// exempt obligations, after length bytes already in the packet.
+func (f *framer) appendOrdinaryControlFrames(
+	frames []ackhandler.Frame,
+	length protocol.ByteCount,
+	maxLen protocol.ByteCount,
+	now monotime.Time,
+	v protocol.Version,
+) ([]ackhandler.Frame, protocol.ByteCount) {
 	// add stream-related control frames
 	for id, str := range f.streamsWithControlFrames {
 	start:

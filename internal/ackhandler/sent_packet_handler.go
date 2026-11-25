@@ -177,6 +177,9 @@ type lostRecord struct {
 	sent     monotime.Time
 	reported bool   // to a PathSender
 	gen      uint32 // the PathSender it was reported to
+	// counted says the loss was added to the connection's PacketsLost and
+	// BytesLost by the transport, which takes it back on a correction.
+	counted bool
 }
 
 // clientAddressValidated indicates whether the address was validated beforehand by an address validation token.
@@ -614,7 +617,9 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	}
 
 	if ps == nil {
-		if cex, ok := cc.(congestion.SendAlgorithmEx); ok &&
+		// The controller installed now: one replaced during this ACK gets
+		// no aggregate event after its replacement.
+		if cex, ok := h.getCongestionControl().(congestion.SendAlgorithmEx); ok &&
 			(len(h.ackedPacketsInfo) != 0 || len(h.lostPacketsInfo) != 0) {
 			cex.OnCongestionEventEx(priorInFlight, rcvTime, h.ackedPacketsInfo, h.lostPacketsInfo)
 		}
@@ -743,6 +748,11 @@ func (h *sentPacketHandler) creditLateAcks(ack *wire.AckFrame, rcvTime monotime.
 			h.progress.Epoch++
 			h.progress.Last = rcvTime
 			h.progress.PTOExpiries = 0
+			if rec.counted {
+				// A spurious loss: the transport takes back what it counted.
+				h.connStats.PacketsLost.Add(^uint64(0))
+				h.connStats.BytesLost.Add(^uint64(rec.size - 1))
+			}
 			if ps != nil && rec.reported && rec.gen == h.controllerGen {
 				refs = append(refs, congestionExt.PacketRef{Space: congestionExt.SpaceApplication, Number: congestionExt.PacketNumber(rec.pn), Bytes: congestionExt.ByteCount(rec.size)})
 			}
@@ -1117,7 +1127,7 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 					BytesLost:    congestionExt.ByteCount(p.Length),
 				})
 				if encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT {
-					h.recordLateAck(lostRecord{pn: pn, size: p.Length, sent: p.SendTime, reported: ps != nil, gen: h.controllerGen})
+					h.recordLateAck(lostRecord{pn: pn, size: p.Length, sent: p.SendTime, reported: ps != nil, gen: h.controllerGen, counted: ps != nil && !p.IsPathMTUProbePacket})
 				}
 				if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
 					h.ecnTracker.LostPacket(pn)
@@ -1768,8 +1778,10 @@ func (h *sentPacketHandler) sentPacketInfo(t monotime.Time, encLevel protocol.En
 	if framed < p.Length {
 		overhead := congestionExt.ByteCount(p.Length - framed)
 		class := congestionExt.ClassExempt
-		if turn := h.permit.Turn; h.classed && !exempt && h.permit.OK && turn != congestionExt.ClassExempt && turn < congestionExt.NumSendClasses && info.ClassBytes[turn] > 0 {
-			// A class-scheduled packet's overhead is its turn's.
+		carriesWork := info.ClassBytes[congestionExt.ClassControl]+info.ClassBytes[congestionExt.ClassInteractive]+info.ClassBytes[congestionExt.ClassBulk] > 0
+		if turn := h.permit.Turn; h.classed && !exempt && h.permit.OK && turn != congestionExt.ClassExempt && turn < congestionExt.NumSendClasses && carriesWork {
+			// A class-scheduled packet's overhead is its turn's, even when
+			// only fill classes found room in it.
 			class = turn
 		} else {
 			for _, c := range []congestionExt.SendClass{congestionExt.ClassControl, congestionExt.ClassInteractive, congestionExt.ClassBulk} {

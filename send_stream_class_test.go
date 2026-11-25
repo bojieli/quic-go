@@ -34,7 +34,7 @@ func writeClassBuffered(t *testing.T, str *SendStream, n int, class congestion.S
 
 func popClassed(t *testing.T, str *SendStream, maxBytes protocol.ByteCount) (ackhandler.StreamFrame, congestion.SendClass, congestion.SendClass) {
 	t.Helper()
-	f, _, _, served, next := str.popClassedStreamFrame(maxBytes, protocol.Version1)
+	f, _, _, served, next := str.popClassedStreamFrame(maxBytes, str.streamClass(), protocol.Version1)
 	require.NotNil(t, f.Frame)
 	return f, served, next
 }
@@ -96,7 +96,7 @@ func TestSendStreamBoost(t *testing.T) {
 
 	var controlBytes, bulkBytes protocol.ByteCount
 	for {
-		sf, _, _, served, _ := str.popClassedStreamFrame(1200, protocol.Version1)
+		sf, _, _, served, _ := str.popClassedStreamFrame(1200, str.streamClass(), protocol.Version1)
 		if sf.Frame == nil {
 			break
 		}

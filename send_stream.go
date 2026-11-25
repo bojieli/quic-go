@@ -367,6 +367,10 @@ func (s *SendStream) popStreamFrame(maxBytes protocol.ByteCount, v protocol.Vers
 	if f != nil {
 		s.numOutstandingFrames++
 	}
+	if s.classTagged {
+		// Classes recorded for bytes now sent are no longer needed.
+		s.pruneClassSegs()
+	}
 	s.capturePrefix(f)
 	if repair := s.prefixRepair; repair != nil {
 		if len(repair.data) > 0 {

@@ -237,10 +237,15 @@ func (s *SendStream) streamClass() congestion.SendClass {
 // popClassedStreamFrame is popStreamFrame for a class-scheduled connection.
 // The frame is charged to the stream's effective class, which it returns
 // along with the effective class after the pop; new data is cut where the
-// class it is served at changes.
-func (s *SendStream) popClassedStreamFrame(maxBytes protocol.ByteCount, v protocol.Version) (_ ackhandler.StreamFrame, _ *wire.StreamDataBlockedFrame, hasMore bool, served, next congestion.SendClass) {
+// class it is served at changes. The class is checked under the stream's
+// lock: if it is not want, nothing is taken.
+func (s *SendStream) popClassedStreamFrame(maxBytes protocol.ByteCount, want congestion.SendClass, v protocol.Version) (_ ackhandler.StreamFrame, _ *wire.StreamDataBlockedFrame, hasMore bool, served, next congestion.SendClass) {
 	s.mutex.Lock()
 	served = s.effectiveClass()
+	if served != want {
+		s.mutex.Unlock()
+		return ackhandler.StreamFrame{}, nil, true, served, served
+	}
 	if s.classTagged && len(s.retransmissionQueue) == 0 {
 		if _, end := s.newDataClass(); end != noClassLimit && end > s.writeOffset {
 			s.classLimit = end - s.writeOffset

@@ -599,8 +599,9 @@ func (p *packetPacker) appendPacket(
 	hdrLen := wire.ShortHeaderLen(connID, pnLen)
 	var pl payload
 	if permit, ok := p.currentClassPermit(onlyAck); ok {
+		fullPayload := maxPacketSize - hdrLen - protocol.ByteCount(sealer.Overhead())
 		maxPacketSize = min(maxPacketSize, protocol.ByteCount(permit.MaxBytes))
-		pl = p.maybeGetClassedPacket(maxPacketSize-hdrLen-protocol.ByteCount(sealer.Overhead()), permit, now, v)
+		pl = p.maybeGetClassedPacket(maxPacketSize-hdrLen-protocol.ByteCount(sealer.Overhead()), fullPayload, permit, true, now, v)
 	} else {
 		pl = p.maybeGetShortHeaderPacket(sealer, hdrLen, maxPacketSize, onlyAck, now, v)
 	}
@@ -757,6 +758,14 @@ func (p *packetPacker) maybeGetAppDataPacket(
 	now monotime.Time,
 	v protocol.Version,
 ) payload {
+	if permit, ok := p.currentClassPermit(onlyAck); ok {
+		// Application data in a coalesced packet before the handshake is
+		// confirmed: the permit's classes apply to it too, and MaxBytes
+		// bounds its payload (the coalesced datagram keeps the padding the
+		// handshake needs). Its datagram limit is not known here, so no
+		// DATAGRAM is discarded for size.
+		return p.maybeGetClassedPacket(min(maxPayloadSize, protocol.ByteCount(permit.MaxBytes)), 0, permit, ackAllowed, now, v)
+	}
 	pl := p.composeNextPacket(maxPayloadSize, onlyAck, ackAllowed, now, v)
 
 	// check if we have anything to send

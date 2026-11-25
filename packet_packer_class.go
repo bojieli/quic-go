@@ -11,14 +11,23 @@ import (
 // classedFrameSource is the framer's class-aware interface. A frame source
 // that does not implement it (a test double) is built from as before.
 type classedFrameSource interface {
-	AppendClass([]ackhandler.Frame, []ackhandler.StreamFrame, congestion.SendClass, protocol.ByteCount, monotime.Time, protocol.Version) ([]ackhandler.Frame, []ackhandler.StreamFrame, protocol.ByteCount)
+	AppendClass(_ []ackhandler.Frame, _ []ackhandler.StreamFrame, _ congestion.SendClass, maxLen protocol.ByteCount, last bool, _ monotime.Time, _ protocol.Version) ([]ackhandler.Frame, []ackhandler.StreamFrame, protocol.ByteCount)
 }
+
+var _ classedFrameSource = &framer{}
 
 // classOrder is the order in which classes fill a packet after its turn.
 var classOrder = [...]congestion.SendClass{congestion.ClassControl, congestion.ClassInteractive, congestion.ClassBulk}
 
+// minClassedPayload is the least payload a class-scheduled packet is built
+// in. An ACK frame truncated to its first range, with ECN counts, and a PING
+// fit in it, so a packet is never built larger than its permit. A permit
+// smaller than this builds nothing: it is the scheduler's to size.
+const minClassedPayload protocol.ByteCount = 64
+
 // currentClassPermit returns the permit the next packet is built under, if
-// the connection schedules classes and holds a permit.
+// the connection schedules classes and holds a permit. A permit of zero bytes
+// is returned too: it builds nothing, rather than an unrestricted packet.
 func (p *packetPacker) currentClassPermit(onlyAck bool) (congestion.Permit, bool) {
 	if onlyAck || p.classPermit == nil {
 		return congestion.Permit{}, false
@@ -27,24 +36,29 @@ func (p *packetPacker) currentClassPermit(onlyAck bool) (congestion.Permit, bool
 		return congestion.Permit{}, false
 	}
 	permit, ok := p.classPermit()
-	if !ok || !permit.OK || permit.MaxBytes <= 0 {
+	if !ok || !permit.OK {
 		return congestion.Permit{}, false
 	}
 	return permit, true
 }
 
-// maybeGetClassedPacket builds a 1-RTT payload under a class-scheduling
-// permit (congestion.ClassScheduler): exempt obligations, then bytes of the
-// permit's turn, then bytes of each class listed in Fill up to its allowance.
-// Whatever space is left stays empty.
-func (p *packetPacker) maybeGetClassedPacket(maxPayloadSize protocol.ByteCount, permit congestion.Permit, now monotime.Time, v protocol.Version) payload {
-	pl := p.composeClassedPacket(maxPayloadSize, permit, now, v)
+// maybeGetClassedPacket builds a 1-RTT (or 0-RTT) payload under a
+// class-scheduling permit (congestion.ClassScheduler): exempt obligations,
+// then bytes of the permit's turn, then bytes of each class listed in Fill up
+// to its allowance. Whatever space is left stays empty. fullPayload is the
+// payload a packet of the connection's maximum size would have, which decides
+// whether a DATAGRAM can ever be sent; zero means it is not known here.
+func (p *packetPacker) maybeGetClassedPacket(maxPayloadSize, fullPayload protocol.ByteCount, permit congestion.Permit, ackAllowed bool, now monotime.Time, v protocol.Version) payload {
+	if maxPayloadSize < minClassedPayload {
+		return payload{}
+	}
+	pl := p.composeClassedPacket(maxPayloadSize, fullPayload, permit, ackAllowed, now, v)
 	if len(pl.frames) == 0 && len(pl.streamFrames) == 0 {
 		if pl.ack == nil {
 			return payload{}
 		}
-		if p.numNonAckElicitingAcks >= protocol.MaxNonAckElicitingAcks {
-			ping := &wire.PingFrame{}
+		ping := &wire.PingFrame{}
+		if p.numNonAckElicitingAcks >= protocol.MaxNonAckElicitingAcks && pl.length+ping.Length(v) <= maxPayloadSize {
 			pl.frames = append(pl.frames, ackhandler.Frame{Frame: ping})
 			pl.length += ping.Length(v)
 			p.numNonAckElicitingAcks = 0
@@ -57,16 +71,18 @@ func (p *packetPacker) maybeGetClassedPacket(maxPayloadSize protocol.ByteCount, 
 	return pl
 }
 
-func (p *packetPacker) composeClassedPacket(maxPayloadSize protocol.ByteCount, permit congestion.Permit, now monotime.Time, v protocol.Version) payload {
+func (p *packetPacker) composeClassedPacket(maxPayloadSize, fullPayload protocol.ByteCount, permit congestion.Permit, ackAllowed bool, now monotime.Time, v protocol.Version) payload {
 	cf := p.framer.(classedFrameSource)
 	hasData := p.framer.HasData()
 	hasRetransmission := p.retransmissionQueue.HasData(protocol.Encryption1RTT)
 
 	var pl payload
-	if ack := p.acks.GetAckFrame(protocol.Encryption1RTT, now, !hasRetransmission && !hasData); ack != nil {
-		ack.Truncate(maxPayloadSize, v)
-		pl.ack = ack
-		pl.length += ack.Length(v)
+	if ackAllowed {
+		if ack := p.acks.GetAckFrame(protocol.Encryption1RTT, now, !hasRetransmission && !hasData); ack != nil {
+			ack.Truncate(maxPayloadSize, v)
+			pl.ack = ack
+			pl.length += ack.Length(v)
+		}
 	}
 	startLen := len(pl.frames)
 	// Exempt obligations ride whatever the turn.
@@ -111,11 +127,14 @@ func (p *packetPacker) composeClassedPacket(maxPayloadSize protocol.ByteCount, p
 				}
 			}
 		case congestion.ClassInteractive:
-			used += p.appendClassedDatagram(&pl, limit, maxPayloadSize, class == permit.Turn, v)
+			used += p.appendClassedDatagram(&pl, limit, maxPayloadSize, fullPayload, class == permit.Turn, v)
 		}
 		if hasData && limit > used {
+			// A class that has the rest of the packet may count on being
+			// last and use the bytes of the final length field.
+			last := limit >= remaining
 			var n protocol.ByteCount
-			pl.frames, pl.streamFrames, n = cf.AppendClass(pl.frames, pl.streamFrames, class, limit-used, now, v)
+			pl.frames, pl.streamFrames, n = cf.AppendClass(pl.frames, pl.streamFrames, class, limit-used, last, now, v)
 			used += n
 		}
 		pl.length += used
@@ -141,13 +160,13 @@ func (p *packetPacker) composeClassedPacket(maxPayloadSize protocol.ByteCount, p
 }
 
 // appendClassedDatagram adds the queued DATAGRAM frame if it fits within
-// limit. A frame that cannot fit an empty packet is discarded, as by the
-// ordinary builder. One that fits an empty packet but not this one stays
-// queued: when its class has the turn and an ACK or exempt frame took the
-// room, the ordinary builder's retry count applies, and when its class only
-// fills leftover space nothing is counted, so a frame larger than the class's
-// allowance waits for the class's turn instead of being dropped.
-func (p *packetPacker) appendClassedDatagram(pl *payload, limit, maxPayloadSize protocol.ByteCount, turn bool, v protocol.Version) protocol.ByteCount {
+// limit. A frame that cannot fit a packet of the connection's maximum size
+// is discarded, as by the ordinary builder. One that could stays queued:
+// when its class has the turn of a full-size packet and an ACK or exempt
+// frame took the room, the ordinary builder's retry count applies; when its
+// class only fills leftover space, or the permit is short, nothing is
+// counted, so it waits for a turn with room instead of being dropped.
+func (p *packetPacker) appendClassedDatagram(pl *payload, limit, maxPayloadSize, fullPayload protocol.ByteCount, turn bool, v protocol.Version) protocol.ByteCount {
 	if p.datagramQueue == nil {
 		return 0
 	}
@@ -162,7 +181,10 @@ func (p *packetPacker) appendClassedDatagram(pl *payload, limit, maxPayloadSize 
 		p.peekTimes = 0
 		return size
 	}
-	if size > maxPayloadSize {
+	if fullPayload == 0 {
+		return 0
+	}
+	if size > fullPayload {
 		// It would not fit a packet that carried nothing else.
 		if p.datagramQueue.logger != nil && p.datagramQueue.logger.Debug() {
 			p.datagramQueue.logger.Debugf("Discarded DATAGRAM frame (%d bytes payload)", size)
@@ -171,8 +193,9 @@ func (p *packetPacker) appendClassedDatagram(pl *payload, limit, maxPayloadSize 
 		p.peekTimes = 0
 		return 0
 	}
-	if !turn || size <= maxPayloadSize-pl.length {
-		// Only the class's allowance, not the packet, was too small.
+	if !turn || maxPayloadSize < fullPayload || size <= maxPayloadSize-pl.length {
+		// Only the class's allowance or the permit, not the packet, was too
+		// small.
 		return 0
 	}
 	p.peekTimes++
