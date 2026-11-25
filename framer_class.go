@@ -9,6 +9,11 @@ import (
 	"github.com/apernet/quic-go/quicvarint"
 )
 
+// minStreamFrameLen is the smallest STREAM frame: a type byte, a one-byte
+// stream ID and a one-byte length, carrying a FIN or a byte at offset zero
+// takes at least this.
+const minStreamFrameLen protocol.ByteCount = 3
+
 // ringEntry is a stream filed in a class ring. Only the entry whose
 // generation is the stream's current one is live; re-filing a stream makes a
 // new entry and leaves the old one to be skipped, so a stream that moves away
@@ -360,9 +365,9 @@ func (f *framer) appendClassStreams(
 	defer func() { f.serving = false }()
 	for range ring.Len() {
 		remaining := maxLen - length
-		if remaining <= 0 {
+		if remaining < minStreamFrameLen {
 			// The stream's own frame sizing decides what fits a small
-			// budget; nothing fits none.
+			// budget, but no STREAM frame fits below this.
 			break
 		}
 		e := ring.PopFront()

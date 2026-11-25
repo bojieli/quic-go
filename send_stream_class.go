@@ -114,14 +114,16 @@ func (s *SendStream) recordClass(start protocol.ByteCount, class congestion.Send
 	s.classSegs = append(s.classSegs, classSeg{start: start, class: class})
 }
 
-// trimClassSegs drops the segments that start at or after end. It must be
-// called with the mutex held.
-func (s *SendStream) trimClassSegs(end protocol.ByteCount) {
+// trimClassSegs drops the segments that start at or after end, and says
+// whether it dropped any. It must be called with the mutex held.
+func (s *SendStream) trimClassSegs(end protocol.ByteCount) bool {
 	i := len(s.classSegs)
 	for i > 0 && s.classSegs[i-1].start >= end {
 		i--
 	}
+	trimmed := i < len(s.classSegs)
 	s.classSegs = s.classSegs[:i]
+	return trimmed
 }
 
 // pruneClassSegs drops the segments that only describe bytes already sent for

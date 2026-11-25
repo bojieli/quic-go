@@ -542,3 +542,20 @@ func TestPermitWithoutClassBuildIsReported(t *testing.T) {
 	require.Equal(t, congestion.ByteCount(150), p.ClassBytes[congestion.ClassBulk])
 	require.Zero(t, p.ClassBytes[congestion.ClassInteractive])
 }
+
+// A class-built packet that carries only exempt frames (an ACK, a
+// PATH_RESPONSE) charges its overhead to the turn that admitted it.
+func TestExemptOnlyClassBuildChargesOverheadToTheTurn(t *testing.T) {
+	rec := newRecordingPathSender()
+	sph := NewSentPacketHandler(0, 1200, utils.NewRTTStats(), &utils.ConnectionStats{}, true, false, nil, protocol.PerspectiveClient, false, nil, utils.DefaultLogger).(*sentPacketHandler)
+	sph.InstallPathSender(classedRecordingPathSender{rec}, monotime.Now(), func() {})
+	rec.admit = congestion.Permit{OK: true, Turn: congestion.ClassBulk, MaxBytes: 1200}
+	require.Equal(t, SendAny, sph.SendMode(monotime.Now()))
+	pr := &wire.PathResponseFrame{Data: [8]byte{1}}
+	pn := sph.PopPacketNumber(protocol.Encryption1RTT)
+	sph.ExpectClassBuilt()
+	sph.SentPacket(monotime.Now(), pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: pr}}, protocol.Encryption1RTT, protocol.ECNNon, 40, false, false)
+	got := rec.sent[len(rec.sent)-1].ClassBytes
+	require.Equal(t, congestion.ByteCount(pr.Length(protocol.Version1)), got[congestion.ClassExempt])
+	require.Equal(t, congestion.ByteCount(40)-got[congestion.ClassExempt], got[congestion.ClassBulk])
+}

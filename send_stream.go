@@ -232,11 +232,10 @@ func (s *SendStream) writeClassed(p []byte, limiter func(int) int, class congest
 		var refile bool
 		if s.classTagged {
 			// A write that returned short leaves no class behind for the
-			// bytes it never handed over. If that changes the class the
-			// stream is served at, it is re-filed.
-			before := s.effectiveClass()
-			s.trimClassSegs(s.heldEnd())
-			refile = s.effectiveClass() != before && s.holdsData()
+			// bytes it never handed over. The write may have filed the
+			// stream by their class, so whatever the stream still has to
+			// send is re-filed by its class now.
+			refile = s.trimClassSegs(s.heldEnd()) && (s.holdsData() || s.hasSendableDataLocked(true))
 		}
 		s.mutex.Unlock()
 		if refile {

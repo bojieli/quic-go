@@ -162,11 +162,10 @@ func (p *packetPacker) composeClassedPacket(maxPayloadSize, fullPayload protocol
 
 // appendClassedDatagram adds the queued DATAGRAM frame if it fits within
 // limit. A frame that cannot fit a packet of the connection's maximum size
-// is discarded, as by the ordinary builder. One that could stays queued:
-// when its class has the turn of a full-size packet and an ACK or exempt
-// frame took the room, the ordinary builder's retry count applies; when its
-// class only fills leftover space, or the permit is short, nothing is
-// counted, so it waits for a turn with room instead of being dropped.
+// is discarded, as by the ordinary builder. One that could stays queued,
+// whatever kept it out of this packet -- a Fill allowance, a short permit, or
+// an ACK or exempt frame taking the room -- and goes in a packet with room.
+// Unlike the ordinary builder, it is never dropped for being crowded out.
 func (p *packetPacker) appendClassedDatagram(pl *payload, limit, maxPayloadSize, fullPayload protocol.ByteCount, turn bool, v protocol.Version) protocol.ByteCount {
 	if p.datagramQueue == nil {
 		return 0
@@ -195,18 +194,8 @@ func (p *packetPacker) appendClassedDatagram(pl *payload, limit, maxPayloadSize,
 	if fullPayload == 0 {
 		return 0
 	}
-	if !turn || maxPayloadSize < fullPayload || size <= maxPayloadSize-pl.length {
-		// Only the class's allowance or the permit, not the packet, was too
-		// small.
-		return 0
-	}
-	p.peekTimes++
-	if p.peekTimes > DatagramFrameMaxPeekTimes {
-		if p.datagramQueue.logger != nil && p.datagramQueue.logger.Debug() {
-			p.datagramQueue.logger.Debugf("Discarded DATAGRAM frame (%d bytes payload)", size)
-		}
-		p.datagramQueue.PopDiscarded()
-		p.peekTimes = 0
-	}
+	// It fits a packet of this connection: it stays queued, however many
+	// turns an ACK or exempt frame crowds it out of, and goes when one has
+	// room.
 	return 0
 }

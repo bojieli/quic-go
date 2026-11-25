@@ -548,3 +548,37 @@ func TestClassedFramerCoalescesDeferredNotifications(t *testing.T) {
 	h.framer.controlFrameMutex.Unlock()
 	require.LessOrEqual(t, queued, 2, "deferred notifications accumulate")
 }
+
+// A held stream control frame is checked against its actual length in an
+// ordinary build too: a RESET_STREAM_AT larger than the space left waits.
+func TestHeldControlFrameIsSizedInOrdinaryBuilds(t *testing.T) {
+	h := newBuilderHarness(true)
+	big := &fakeControlStream{frames: []wire.Frame{&wire.ResetStreamFrame{StreamID: 1 << 60, ErrorCode: 1 << 60, FinalSize: 1 << 60, ReliableSize: 1 << 59}}}
+	h.framer.AddStreamWithControlFrames(8, big)
+	frames, _, _ := h.framer.AppendClass(nil, nil, congestion.ClassControl, 10, false, monotime.Now(), protocol.Version1)
+	require.Empty(t, frames)
+	h.framer.SetClassed(false)
+	frames, _, n := h.framer.Append(nil, nil, 30, monotime.Now(), protocol.Version1)
+	require.Empty(t, frames, "a 33-byte frame was put in 30 bytes")
+	require.Zero(t, n)
+	frames, _, _ = h.framer.Append(nil, nil, 100, monotime.Now(), protocol.Version1)
+	require.Len(t, frames, 1)
+}
+
+// A datagram that fits a packet stays queued however many full-size
+// INTERACTIVE turns an exempt frame crowds it out of, and goes when one has
+// room.
+func TestClassedBuilderNeverDropsACrowdedDatagram(t *testing.T) {
+	h := newBuilderHarness(true)
+	dgLen := (&wire.DatagramFrame{DataLenPresent: true, Data: make([]byte, 1)}).Length(protocol.Version1) - 1
+	h.datagram(int(testPayload-dgLen-2), 5) // fits only an otherwise empty packet
+	permit := congestion.Permit{OK: true, Turn: congestion.ClassInteractive, MaxBytes: 1252}
+	for i := range 3 * DatagramFrameMaxPeekTimes {
+		h.framer.QueueControlFrame(&wire.PathResponseFrame{Data: [8]byte{byte(i)}})
+		pl := h.packer.composeClassedPacket(testPayload, testPayload, permit, true, monotime.Now(), protocol.Version1)
+		require.Len(t, pl.frames, 1, "the PATH_RESPONSE alone")
+		require.NotNil(t, h.dq.Peek(), "a crowded datagram was dropped")
+	}
+	pl := h.packer.composeClassedPacket(testPayload, testPayload, permit, true, monotime.Now(), protocol.Version1)
+	require.IsType(t, &wire.DatagramFrame{}, pl.frames[0].Frame)
+}

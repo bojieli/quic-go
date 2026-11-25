@@ -7,6 +7,7 @@ import (
 
 	"github.com/apernet/quic-go/congestion"
 	"github.com/apernet/quic-go/internal/ackhandler"
+	"github.com/apernet/quic-go/internal/monotime"
 	"github.com/apernet/quic-go/internal/protocol"
 
 	"github.com/stretchr/testify/require"
@@ -231,4 +232,22 @@ func TestControlRetransmissionCountTracksTheQueue(t *testing.T) {
 	}
 	str.CancelWrite(1)
 	check()
+}
+
+// A classed write that times out re-files what the stream still has to send
+// by its class: a BULK retransmission filed as CONTROL by the write must be
+// found again on a BULK turn.
+func TestTimedOutClassedWriteRefilesAPendingRetransmission(t *testing.T) {
+	h := newBuilderHarness(true)
+	str := h.stream(36)
+	writeClassBuffered(t, str, 100, congestion.ClassBulk)
+	_, sfs, _ := h.framer.AppendClass(nil, nil, congestion.ClassBulk, 1200, true, monotime.Now(), protocol.Version1)
+	require.Len(t, sfs, 1)
+	sfs[0].Handler.OnLost(sfs[0].Frame) // a BULK retransmission, no new data
+	require.NoError(t, str.SetWriteDeadline(time.Now().Add(20*time.Millisecond)))
+	_, err := str.WriteClass(make([]byte, 4000), congestion.ClassControl)
+	require.Error(t, err)
+	require.Equal(t, congestion.ClassBulk, str.streamClass())
+	_, sfs, _ = h.framer.AppendClass(nil, nil, congestion.ClassBulk, 1200, true, monotime.Now(), protocol.Version1)
+	require.Len(t, sfs, 1, "the retransmission is stranded in the CONTROL ring")
 }

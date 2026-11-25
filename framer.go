@@ -299,10 +299,14 @@ func (f *framer) appendStreamControlFramesBelow(
 ) ([]ackhandler.Frame, protocol.ByteCount) {
 	// Frames a class-scheduled pass held (empty unless the connection
 	// scheduled classes) go first.
-	for len(f.heldStreamControl) > 0 && maxLen-length > maxFrame {
+	for len(f.heldStreamControl) > 0 {
 		fr := f.heldStreamControl[0]
+		l := fr.Frame.Length(v)
+		if l > maxLen-length {
+			break
+		}
 		frames = append(frames, fr)
-		length += fr.Frame.Length(v)
+		length += l
 		f.heldStreamControl = f.heldStreamControl[1:]
 	}
 	// add stream-related control frames

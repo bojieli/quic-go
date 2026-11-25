@@ -624,9 +624,11 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 
 	if ps == nil {
 		// The aggregate event goes to the controller that received this
-		// ACK's per-packet callbacks, and only while it is still installed:
-		// a controller replaced meanwhile gets nothing after its
-		// replacement, and its successor nothing that was its.
+		// ACK's per-packet callbacks, and is withheld from it if it was
+		// replaced while they were delivered, and never redirected to its
+		// successor. A replacement on another goroutine that races the call
+		// itself is not excluded: legacy controllers are swapped outside the
+		// run loop, as before.
 		if cex, ok := cc.(congestion.SendAlgorithmEx); ok && h.getCongestionControl() == cc &&
 			(len(h.ackedPacketsInfo) != 0 || len(h.lostPacketsInfo) != 0) {
 			cex.OnCongestionEventEx(priorInFlight, rcvTime, h.ackedPacketsInfo, h.lostPacketsInfo)
@@ -1795,10 +1797,9 @@ func (h *sentPacketHandler) sentPacketInfo(t monotime.Time, encLevel protocol.En
 	if framed < p.Length {
 		overhead := congestionExt.ByteCount(p.Length - framed)
 		class := congestionExt.ClassExempt
-		carriesWork := info.ClassBytes[congestionExt.ClassControl]+info.ClassBytes[congestionExt.ClassInteractive]+info.ClassBytes[congestionExt.ClassBulk] > 0
-		if turn := h.permit.Turn; h.classed && classBuilt && !exempt && h.permit.OK && turn != congestionExt.ClassExempt && turn < congestionExt.NumSendClasses && carriesWork {
-			// A class-scheduled packet's overhead is its turn's, even when
-			// only fill classes found room in it.
+		if turn := h.permit.Turn; h.classed && classBuilt && !exempt && h.permit.OK && turn != congestionExt.ClassExempt && turn < congestionExt.NumSendClasses {
+			// A class-built packet's overhead is its turn's, even when only
+			// fill classes, or only exempt frames, found room in it.
 			class = turn
 		} else {
 			for _, c := range []congestionExt.SendClass{congestionExt.ClassControl, congestionExt.ClassInteractive, congestionExt.ClassBulk} {
