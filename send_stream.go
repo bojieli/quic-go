@@ -521,7 +521,9 @@ func (s *SendStream) popNewStreamFrame(maxDataLen protocol.ByteCount) (_ *wire.S
 func (s *SendStream) AcceptedOffset() protocol.ByteCount {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	n := s.writeOffset + protocol.ByteCount(len(s.dataForWriting))
+	// The unconsumed tail of a blocking Write is not accepted yet: the write
+	// may still time out and return short.
+	n := s.writeOffset
 	if s.nextFrame != nil {
 		n += s.nextFrame.DataLen()
 	}
@@ -531,46 +533,83 @@ func (s *SendStream) AcceptedOffset() protocol.ByteCount {
 // popGrantedStreamFrame pops a frame that carries only bytes of [start, end):
 // a queued retransmission inside the range first, then new data at the write
 // offset. It is the verification grant's build path.
-func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCount, v protocol.Version) ackhandler.StreamFrame {
+func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCount, v protocol.Version) (ackhandler.StreamFrame, *wire.StreamDataBlockedFrame) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	if s.shutdownErr != nil || s.resetErr != nil {
-		return ackhandler.StreamFrame{}
+		return ackhandler.StreamFrame{}, nil
 	}
 	limit := func(offset protocol.ByteCount) protocol.ByteCount {
 		header := (&wire.StreamFrame{StreamID: s.streamID, Offset: offset, DataLenPresent: true}).Length(v)
 		return min(maxBytes, header+end-offset)
 	}
 	for i, f := range s.retransmissionQueue {
-		if f.Offset < start || f.Offset >= end {
+		if f.Offset >= end || f.Offset+f.DataLen() <= start {
 			continue
+		}
+		if f.Offset < start {
+			// Split at the grant's start: the uncovered front stays queued
+			// for ordinary admission.
+			tail := &wire.StreamFrame{
+				StreamID:       f.StreamID,
+				Offset:         start,
+				DataLenPresent: true,
+				Fin:            f.Fin,
+				Data:           append([]byte(nil), f.Data[start-f.Offset:]...),
+			}
+			f.Data = f.Data[:start-f.Offset]
+			f.Fin = false
+			s.retransmissionQueue = slices.Insert(s.retransmissionQueue, i+1, tail)
+			f, i = tail, i+1
 		}
 		size := limit(f.Offset)
 		newFrame, needsSplit := f.MaybeSplitOffFrame(size, v)
 		if needsSplit {
 			if newFrame == nil {
-				return ackhandler.StreamFrame{}
+				return ackhandler.StreamFrame{}, nil
 			}
 			s.numOutstandingFrames++
-			return ackhandler.StreamFrame{Frame: newFrame, Handler: (*sendStreamAckHandler)(s)}
+			return ackhandler.StreamFrame{Frame: newFrame, Handler: (*sendStreamAckHandler)(s)}, nil
 		}
 		s.retransmissionQueue = slices.Delete(s.retransmissionQueue, i, i+1)
 		s.numOutstandingFrames++
-		return ackhandler.StreamFrame{Frame: f, Handler: (*sendStreamAckHandler)(s)}
+		return ackhandler.StreamFrame{Frame: f, Handler: (*sendStreamAckHandler)(s)}, nil
 	}
 	if s.writeOffset < start || s.writeOffset >= end {
-		return ackhandler.StreamFrame{}
+		return ackhandler.StreamFrame{}, nil
 	}
 	// New data only: retransmissions outside the range stay queued.
 	queued := s.retransmissionQueue
 	s.retransmissionQueue = nil
-	f, _, _ := s.popNewOrRetransmittedStreamFrame(limit(s.writeOffset), v)
+	f, blocked, _ := s.popNewOrRetransmittedStreamFrame(limit(s.writeOffset), v)
 	s.retransmissionQueue = queued
 	if f == nil {
-		return ackhandler.StreamFrame{}
+		return ackhandler.StreamFrame{}, blocked
 	}
 	s.numOutstandingFrames++
-	return ackhandler.StreamFrame{Frame: f, Handler: (*sendStreamAckHandler)(s)}
+	return ackhandler.StreamFrame{Frame: f, Handler: (*sendStreamAckHandler)(s)}, blocked
+}
+
+// hasSendableData says, without consuming anything, whether a frame could be
+// popped now: a retransmission, reserved bytes, a FIN, or new bytes the
+// stream's flow control allows (connWindow says whether the connection's
+// does).
+func (s *SendStream) hasSendableData(connWindow bool) bool {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if s.shutdownErr != nil {
+		return false
+	}
+	if len(s.retransmissionQueue) > 0 || s.nextFrameReserved {
+		return true
+	}
+	if s.resetErr != nil || s.writeLimited {
+		return false
+	}
+	if len(s.dataForWriting) == 0 && s.nextFrame == nil {
+		return s.finishedWriting && !s.finSent
+	}
+	return connWindow && s.flowController.SendWindowSize() > 0
 }
 
 // grantSendStream makes a SendStream a GrantableStream.

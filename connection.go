@@ -2749,11 +2749,15 @@ func (c *Conn) maybeSendExemptPacket(now monotime.Time) error {
 				// Whatever the packet already holds -- header, AEAD tag, ACK,
 				// exempt frames -- is charged to the grant too.
 				committed := maxSize - maxLen
-				if protocol.ByteCount(g.remaining) <= committed+protocol.MinStreamFrameSize {
+				if protocol.ByteCount(g.remaining) <= committed {
 					return ackhandler.StreamFrame{}
 				}
 				maxLen = min(maxLen, protocol.ByteCount(g.remaining)-committed)
-				sf := g.str.popGrantedStreamFrame(maxLen, protocol.ByteCount(g.grant.Start), protocol.ByteCount(g.grant.End), v)
+				sf, blocked := g.str.popGrantedStreamFrame(maxLen, protocol.ByteCount(g.grant.Start), protocol.ByteCount(g.grant.End), v)
+				if blocked != nil {
+					// Ordinary control work, not covered by the grant.
+					c.framer.QueueControlFrame(blocked)
+				}
 				grantedFrame = sf.Frame != nil
 				return sf
 			}
@@ -2805,6 +2809,9 @@ func (c *Conn) BindVerificationGrant(str GrantableStream, g congestion.Verificat
 	if s == nil {
 		return errors.New("verification grant needs a send stream")
 	}
+	if s.sender != streamSender(c) {
+		return errors.New("verification grant bound to another connection's stream")
+	}
 	c.pathSenderMx.Lock()
 	c.pendingGrant = &boundGrant{grant: g, str: s, remaining: g.Budget}
 	c.hasPendingGrant.Store(true)
@@ -2834,9 +2841,9 @@ func (c *Conn) updateDemand() {
 			c.retransmissionQueue.HasData(protocol.EncryptionHandshake)
 	}
 	d.Eligible[congestion.ClassInteractive] = c.datagramQueue != nil && c.datagramQueue.Peek() != nil
-	// A queued stream is eligible: its bytes were reserved against flow
-	// control when they were accepted, and retransmissions and FIN need none.
-	d.Eligible[congestion.ClassBulk] = c.framer.HasStreamData()
+	// A stream is eligible if it could send a frame now: retransmissions,
+	// reserved bytes and FIN need no credit, new bytes need both windows.
+	d.Eligible[congestion.ClassBulk] = c.framer.HasStreamData(c.connFlowController.SendWindowSize() > 0)
 	if d != c.demand {
 		c.demand = d
 		c.pathSender.OnDemand(d)
@@ -3126,6 +3133,9 @@ func (c *Conn) registerPackedShortHeaderPacket(p shortHeaderPacket, ecn protocol
 	largestAcked := protocol.InvalidPacketNumber
 	if p.Ack != nil {
 		largestAcked = p.Ack.LargestAcked()
+		if c.pathSender != nil {
+			c.sentPacketHandler.ExpectAckLength(p.Ack.Length(c.version))
+		}
 	}
 	c.sentPacketHandler.SentPacket(
 		now,

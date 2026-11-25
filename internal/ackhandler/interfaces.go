@@ -53,6 +53,9 @@ type SentPacketHandler interface {
 	// ExpectGrantedPacket says the next packet registered was built under the
 	// verification grant with this ID.
 	ExpectGrantedPacket(id uint64)
+	// ExpectAckLength says how many bytes of the next packet registered are
+	// its ACK frame, which is not among the frames SentPacket receives.
+	ExpectAckLength(n protocol.ByteCount)
 	// BytesInFlight returns the connection's bytes in flight.
 	BytesInFlight() protocol.ByteCount
 }

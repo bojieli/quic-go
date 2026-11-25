@@ -91,11 +91,21 @@ func (f *framer) HasControlData() bool {
 	return len(f.streamsWithControlFrames) > 0 || len(f.controlFrames) > 0
 }
 
-// HasStreamData says whether a stream has data queued for sending.
-func (f *framer) HasStreamData() bool {
+// HasStreamData says whether a queued stream could send a frame now. It
+// consumes nothing; a stream that cannot say is assumed able to.
+func (f *framer) HasStreamData(connWindow bool) bool {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
-	return !f.streamQueue.Empty()
+	if f.streamQueue.Empty() {
+		return false
+	}
+	for _, str := range f.activeStreams {
+		s, ok := str.(interface{ hasSendableData(bool) bool })
+		if !ok || s.hasSendableData(connWindow) {
+			return true
+		}
+	}
+	return false
 }
 
 // AppendExempt appends only exempt obligations: one PATH_RESPONSE and the

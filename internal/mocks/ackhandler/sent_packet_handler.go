@@ -192,6 +192,42 @@ func (c *MockSentPacketHandlerECNModeCall) DoAndReturn(f func(bool) protocol.ECN
 	return c
 }
 
+// ExpectAckLength mocks base method.
+func (m *MockSentPacketHandler) ExpectAckLength(n protocol.ByteCount) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "ExpectAckLength", n)
+}
+
+// ExpectAckLength indicates an expected call of ExpectAckLength.
+func (mr *MockSentPacketHandlerMockRecorder) ExpectAckLength(n any) *MockSentPacketHandlerExpectAckLengthCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ExpectAckLength", reflect.TypeOf((*MockSentPacketHandler)(nil).ExpectAckLength), n)
+	return &MockSentPacketHandlerExpectAckLengthCall{Call: call}
+}
+
+// MockSentPacketHandlerExpectAckLengthCall wrap *gomock.Call
+type MockSentPacketHandlerExpectAckLengthCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockSentPacketHandlerExpectAckLengthCall) Return() *MockSentPacketHandlerExpectAckLengthCall {
+	c.Call = c.Call.Return()
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockSentPacketHandlerExpectAckLengthCall) Do(f func(protocol.ByteCount)) *MockSentPacketHandlerExpectAckLengthCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockSentPacketHandlerExpectAckLengthCall) DoAndReturn(f func(protocol.ByteCount)) *MockSentPacketHandlerExpectAckLengthCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
 // ExpectGrantedPacket mocks base method.
 func (m *MockSentPacketHandler) ExpectGrantedPacket(id uint64) {
 	m.ctrl.T.Helper()

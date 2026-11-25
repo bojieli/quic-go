@@ -542,7 +542,7 @@ func (p *packetPacker) PackExemptPacket(maxSize protocol.ByteCount, now monotime
 		pl.frames, n = p.framer.AppendExempt(pl.frames, maxPayloadSize-pl.length, v)
 		pl.length += n
 	}
-	if granted != nil && maxPayloadSize-pl.length >= protocol.MinStreamFrameSize {
+	if granted != nil && maxPayloadSize > pl.length {
 		if sf := granted(maxPayloadSize-pl.length, v); sf.Frame != nil {
 			pl.streamFrames = append(pl.streamFrames, sf)
 			pl.length += sf.Frame.Length(v)

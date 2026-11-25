@@ -116,6 +116,8 @@ type sentPacketHandler struct {
 	// grantPending is the verification grant the next packet was built
 	// under, or zero.
 	grantPending uint64
+	// ackLenPending is the size of the next packet's ACK frame.
+	ackLenPending protocol.ByteCount
 	// discardRefs is scratch space for OnDiscarded.
 	discardRefs []congestionExt.PacketRef
 	// lateAcks holds the ack-eliciting application packets declared lost,
@@ -381,7 +383,8 @@ func (h *sentPacketHandler) SentPacket(
 	if isPathProbePacket {
 		pnSpace.history.SentPathProbePacket(pn, p)
 		if ps != nil {
-			ps.OnSent(h.sentPacketInfo(t, encLevel, pn, p, congestionExt.KindPathProbe, true))
+			h.ackLenPending = 0
+			ps.OnSent(h.sentPacketInfo(t, encLevel, pn, p, congestionExt.KindPathProbe, true, 0))
 		}
 		h.setLossDetectionTimer(t)
 		return
@@ -407,7 +410,9 @@ func (h *sentPacketHandler) SentPacket(
 		if grant != 0 {
 			kind = congestionExt.KindVerification
 		}
-		info := h.sentPacketInfo(t, encLevel, pn, p, kind, !underPermit)
+		ackLen := h.ackLenPending
+		h.ackLenPending = 0
+		info := h.sentPacketInfo(t, encLevel, pn, p, kind, !underPermit, ackLen)
 		info.Grant = grant
 		ps.OnSent(info)
 	} else {
@@ -698,38 +703,50 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 	}
 }
 
+// maxLateAcks bounds the late-acknowledgement history.
+const maxLateAcks = 256
+
 // creditLateAcks finds the ack-eliciting application packets declared lost
 // that this ACK acknowledges. Each is transport progress. It returns those
 // reported lost to the installed PathSender, as the references that were
-// reported, and forgets records past the lost-packet tracker's horizon.
+// reported, and forgets records past the lost-packet tracker's horizon. The
+// records are sorted by packet number, so each ACK range is found by binary
+// search: an ACK that covers none of them costs O(ranges * log records).
 func (h *sentPacketHandler) creditLateAcks(ack *wire.AckFrame, rcvTime monotime.Time, ps congestionExt.PathSender) []congestionExt.PacketRef {
 	if len(h.lateAcks) == 0 {
 		return nil
 	}
+	// Records are appended in roughly send order, so expiry is at the front.
 	horizon := rcvTime.Add(-3 * h.rttStats.PTO(false))
+	n := 0
+	for n < len(h.lateAcks) && h.lateAcks[n].sent.Before(horizon) {
+		n++
+	}
+	if n > 0 {
+		h.lateAcks = slices.Delete(h.lateAcks, 0, n)
+	}
+	byNumber := func(e lostRecord, pn protocol.PacketNumber) int { return cmp.Compare(e.pn, pn) }
 	var refs []congestionExt.PacketRef
-	kept := h.lateAcks[:0]
-	ri := len(ack.AckRanges) - 1 // ranges are in descending order
-	for _, r := range h.lateAcks {
-		for ri >= 0 && ack.AckRanges[ri].Largest < r.pn {
-			ri--
+	for _, r := range ack.AckRanges {
+		lo, _ := slices.BinarySearchFunc(h.lateAcks, r.Smallest, byNumber)
+		hi, found := slices.BinarySearchFunc(h.lateAcks, r.Largest, byNumber)
+		if found {
+			hi++
 		}
-		if ri >= 0 && ack.AckRanges[ri].Smallest <= r.pn {
+		if lo >= hi {
+			continue
+		}
+		for _, rec := range h.lateAcks[lo:hi] {
 			h.progress.Epoch++
 			h.progress.Last = rcvTime
 			h.progress.PTOExpiries = 0
-			if ps != nil && r.reported && r.gen == h.controllerGen {
-				refs = append(refs, congestionExt.PacketRef{Space: congestionExt.SpaceApplication, Number: congestionExt.PacketNumber(r.pn), Bytes: congestionExt.ByteCount(r.size)})
+			if ps != nil && rec.reported && rec.gen == h.controllerGen {
+				refs = append(refs, congestionExt.PacketRef{Space: congestionExt.SpaceApplication, Number: congestionExt.PacketNumber(rec.pn), Bytes: congestionExt.ByteCount(rec.size)})
 			}
-			continue
 		}
-		if r.sent.Before(horizon) {
-			continue
-		}
-		kept = append(kept, r)
+		h.lateAcks = slices.Delete(h.lateAcks, lo, hi)
 	}
-	clear(h.lateAcks[len(kept):])
-	h.lateAcks = kept
+	slices.SortFunc(refs, func(a, b congestionExt.PacketRef) int { return cmp.Compare(a.Number, b.Number) })
 	return refs
 }
 
@@ -742,6 +759,9 @@ func (h *sentPacketHandler) recordLateAck(r lostRecord) {
 		return
 	}
 	h.lateAcks = slices.Insert(h.lateAcks, i, r)
+	if len(h.lateAcks) > maxLateAcks {
+		h.lateAcks = slices.Delete(h.lateAcks, 0, len(h.lateAcks)-maxLateAcks)
+	}
 }
 
 // Packets are returned in ascending packet number order.
@@ -1581,6 +1601,9 @@ func (h *sentPacketHandler) ExpectLivenessPing() { h.livenessPending = true }
 // grant.
 func (h *sentPacketHandler) ExpectGrantedPacket(id uint64) { h.grantPending = id }
 
+// ExpectAckLength says how long the next packet's ACK frame is.
+func (h *sentPacketHandler) ExpectAckLength(n protocol.ByteCount) { h.ackLenPending = n }
+
 // BytesInFlight returns the connection's bytes in flight.
 func (h *sentPacketHandler) BytesInFlight() protocol.ByteCount { return h.bytesInFlight }
 
@@ -1660,7 +1683,7 @@ func (h *sentPacketHandler) packetKind(encLevel protocol.EncryptionLevel, p *pac
 // classed by frame type: stream data is BULK, DATAGRAM frames INTERACTIVE,
 // ACK, PING and path validation EXEMPT, anything else CONTROL. Packet
 // overhead is charged to the first non-exempt class the packet carries.
-func (h *sentPacketHandler) sentPacketInfo(t monotime.Time, encLevel protocol.EncryptionLevel, pn protocol.PacketNumber, p *packet, kind congestionExt.PacketKind, exempt bool) congestionExt.SentPacket {
+func (h *sentPacketHandler) sentPacketInfo(t monotime.Time, encLevel protocol.EncryptionLevel, pn protocol.PacketNumber, p *packet, kind congestionExt.PacketKind, exempt bool, ackLen protocol.ByteCount) congestionExt.SentPacket {
 	info := congestionExt.SentPacket{
 		Space:           spaceOf(encLevel),
 		Number:          congestionExt.PacketNumber(pn),
@@ -1672,7 +1695,9 @@ func (h *sentPacketHandler) sentPacketInfo(t monotime.Time, encLevel protocol.En
 		InFlight:        congestionExt.ByteCount(h.bytesInFlight),
 		Time:            t,
 	}
-	var framed protocol.ByteCount
+	// The ACK frame is exempt.
+	framed := min(ackLen, p.Length)
+	info.ClassBytes[congestionExt.ClassExempt] += congestionExt.ByteCount(framed)
 	for _, f := range p.StreamFrames {
 		n := f.Frame.Length(protocol.Version1)
 		info.ClassBytes[congestionExt.ClassBulk] += congestionExt.ByteCount(n)
