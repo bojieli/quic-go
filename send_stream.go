@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/apernet/quic-go/congestion"
 	"github.com/apernet/quic-go/internal/ackhandler"
 	"github.com/apernet/quic-go/internal/monotime"
 	"github.com/apernet/quic-go/internal/protocol"
@@ -50,6 +51,18 @@ type SendStream struct {
 	nextFrame *wire.StreamFrame
 	// set if flow control credit for nextFrame was already consumed
 	nextFrameReserved bool
+
+	// Class scheduling (send_stream_class.go). classTagged is set once the
+	// stream is written with a class or boosted; until then it keeps no
+	// class state. classLimit caps the data length of the next new-data
+	// frame while a classed pop is in progress; it is zero otherwise.
+	classSegs   []classSeg
+	classTagged bool
+	boost       bool
+	classLimit  protocol.ByteCount
+	// controlRetx counts the queued retransmissions charged to CONTROL, so
+	// the effective class needs no scan of the retransmission queue.
+	controlRetx int
 
 	supportsResetStreamAt bool
 	finishedWriting       bool // set once Close() is called
@@ -121,7 +134,7 @@ func (s *SendStream) WriteWithLimit(p []byte, limiter func(maxBytes int) int) (i
 	s.writeOnce <- struct{}{}
 	defer func() { <-s.writeOnce }()
 
-	isNewlyCompleted, n, err := s.write(p, limiter)
+	isNewlyCompleted, n, err := s.writeClassed(p, limiter, congestion.ClassBulk, false)
 	if isNewlyCompleted {
 		s.sender.onStreamCompleted(s.streamID)
 	}
@@ -169,11 +182,16 @@ func (s *SendStream) tryWriteAll(p []byte) (bool /* is newly completed */, bool 
 	}
 
 	bytesToReserve := protocol.ByteCount(len(p))
+	start := s.heldEnd()
 	if s.nextFrame != nil && !s.nextFrameReserved {
 		bytesToReserve += s.nextFrame.DataLen()
 	}
 	if !s.flowController.TryAddBytesSent(bytesToReserve) {
 		return false, false, ErrWouldBlock
+	}
+	if s.classTagged {
+		// Only bytes actually accepted get a class.
+		s.recordWriteClass(congestion.ClassBulk, start)
 	}
 
 	if s.nextFrame == nil {
@@ -204,14 +222,27 @@ func (s *SendStream) tryWriteAll(p []byte) (bool /* is newly completed */, bool 
 	return false, true, nil
 }
 
-func (s *SendStream) write(p []byte, limiter func(int) int) (bool /* is newly completed */, int, error) {
+// writeClassed is the body of every blocking write. classed says the caller
+// named a class; a stream that is not classed and not boosted records none.
+func (s *SendStream) writeClassed(p []byte, limiter func(int) int, class congestion.SendClass, classed bool) (bool /* is newly completed */, int, error) {
 	s.mutex.Lock()
 	s.writeLimiter = limiter
 	s.writeLimited = false
 	defer func() {
 		s.writeLimiter = nil
 		s.writeLimited = false
+		var refile bool
+		if s.classTagged {
+			// A write that returned short leaves no class behind for the
+			// bytes it never handed over. The write may have filed the
+			// stream by their class, so whatever the stream still has to
+			// send is re-filed by its class now.
+			refile = s.trimClassSegs(s.heldEnd()) && (s.holdsData() || s.hasSendableDataLocked(true))
+		}
 		s.mutex.Unlock()
+		if refile {
+			s.sender.onHasStreamData(s.streamID, s)
+		}
 	}()
 
 	if s.resetErr != nil {
@@ -231,6 +262,10 @@ func (s *SendStream) write(p []byte, limiter func(int) int) (bool /* is newly co
 		return false, 0, nil
 	}
 
+	if classed || s.classTagged {
+		s.classTagged = true
+		s.recordWriteClass(class, s.heldEnd())
+	}
 	s.dataForWriting = p
 
 	var (
@@ -343,6 +378,10 @@ func (s *SendStream) popStreamFrame(maxBytes protocol.ByteCount, v protocol.Vers
 	if f != nil {
 		s.numOutstandingFrames++
 	}
+	if s.classTagged {
+		// Classes recorded for bytes now sent are no longer needed.
+		s.pruneClassSegs()
+	}
 	s.capturePrefix(f)
 	if repair := s.prefixRepair; repair != nil {
 		if len(repair.data) > 0 {
@@ -424,6 +463,10 @@ func (s *SendStream) popNewOrRetransmittedStreamFrame(maxBytes protocol.ByteCoun
 	}
 	if s.resetErr != nil && reliableOffset > 0 {
 		maxDataLen = min(maxDataLen, reliableOffset-s.writeOffset)
+	}
+	if s.classLimit > 0 {
+		// A classed pop: the frame ends where the class it is served at does.
+		maxDataLen = min(maxDataLen, s.classLimit)
 	}
 	if s.nextFrame != nil {
 		maxDataLen = min(maxDataLen, s.nextFrame.MaxDataLen(maxBytes, v), s.nextFrame.DataLen())
@@ -531,7 +574,10 @@ func (s *SendStream) AcceptedOffset() protocol.ByteCount {
 // popGrantedStreamFrame pops a frame that carries only bytes of [start, end):
 // a queued retransmission inside the range first, then new data at the write
 // offset. It is the verification grant's build path.
-func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCount, v protocol.Version) (ackhandler.StreamFrame, *wire.StreamDataBlockedFrame) {
+//
+// classed says the connection schedules classes: only then is new data cut
+// at class boundaries and stamped with its class.
+func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCount, classed bool, v protocol.Version) (ackhandler.StreamFrame, *wire.StreamDataBlockedFrame) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	if s.shutdownErr != nil || (s.resetErr != nil && s.reliableOffset() == 0) {
@@ -545,6 +591,16 @@ func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCou
 		n := end - offset
 		header := (&wire.StreamFrame{StreamID: s.streamID, Offset: offset, DataLenPresent: true}).Length(v) - 1 // without the length field
 		return min(maxBytes, header+protocol.ByteCount(quicvarint.Len(uint64(n)))+n)
+	}
+	// On a class-scheduled connection a retransmission is charged to the
+	// class the stream is served at, a boost included, as on the ordinary
+	// classed path.
+	served := s.effectiveClass()
+	stampRetx := func(f *wire.StreamFrame) *wire.StreamFrame {
+		if classed && s.classTagged {
+			f.Class = uint8(served)
+		}
+		return f
 	}
 	for i, f := range s.retransmissionQueue {
 		if f.DataLen() == 0 || f.Offset >= end || f.Offset+f.DataLen() <= start {
@@ -560,10 +616,12 @@ func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCou
 				DataLenPresent: true,
 				Fin:            f.Fin,
 				Data:           append([]byte(nil), f.Data[start-f.Offset:]...),
+				Class:          f.Class,
 			}
 			f.Data = f.Data[:start-f.Offset]
 			f.Fin = false
 			s.retransmissionQueue = slices.Insert(s.retransmissionQueue, i+1, tail)
+			s.countRetx(tail, 1)
 			f, i = tail, i+1
 		}
 		size := limit(f.Offset)
@@ -573,11 +631,12 @@ func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCou
 				return ackhandler.StreamFrame{}, nil
 			}
 			s.numOutstandingFrames++
-			return ackhandler.StreamFrame{Frame: newFrame, Handler: (*sendStreamAckHandler)(s)}, nil
+			return ackhandler.StreamFrame{Frame: stampRetx(newFrame), Handler: (*sendStreamAckHandler)(s)}, nil
 		}
 		s.retransmissionQueue = slices.Delete(s.retransmissionQueue, i, i+1)
+		s.countRetx(f, -1)
 		s.numOutstandingFrames++
-		return ackhandler.StreamFrame{Frame: f, Handler: (*sendStreamAckHandler)(s)}, nil
+		return ackhandler.StreamFrame{Frame: stampRetx(f), Handler: (*sendStreamAckHandler)(s)}, nil
 	}
 	if s.writeOffset < start || s.writeOffset >= end {
 		return ackhandler.StreamFrame{}, nil
@@ -587,13 +646,30 @@ func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCou
 		// the ordinary builder.
 		return ackhandler.StreamFrame{}, nil
 	}
-	// New data only: retransmissions outside the range stay queued.
-	queued := s.retransmissionQueue
-	s.retransmissionQueue = nil
+	// New data only: retransmissions outside the range stay queued. The
+	// frame is charged to the class the stream is served at, taken while
+	// the queue is still in view (a queued CONTROL retransmission makes the
+	// stream CONTROL), and does not mix the classes of its bytes.
+	class := served
+	stamp := classed && s.classTagged
+	queued, queuedControl := s.retransmissionQueue, s.controlRetx
+	s.retransmissionQueue, s.controlRetx = nil, 0
+	if stamp {
+		if _, end := s.newDataClass(); end != noClassLimit && end > s.writeOffset {
+			s.classLimit = end - s.writeOffset
+		}
+	}
 	f, blocked, _ := s.popNewOrRetransmittedStreamFrame(limit(s.writeOffset), v)
-	s.retransmissionQueue = queued
+	s.classLimit = 0
+	s.retransmissionQueue, s.controlRetx = queued, queuedControl
 	if f == nil {
 		return ackhandler.StreamFrame{}, blocked
+	}
+	if stamp {
+		f.Class = uint8(class)
+	}
+	if s.classTagged {
+		s.pruneClassSegs()
 	}
 	// The prefix-repair capture happens here as on the ordinary path; its
 	// redundant copies are offered only by the ordinary builder.
@@ -609,6 +685,10 @@ func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCou
 func (s *SendStream) hasSendableData(connWindow bool) bool {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+	return s.hasSendableDataLocked(connWindow)
+}
+
+func (s *SendStream) hasSendableDataLocked(connWindow bool) bool {
 	if s.shutdownErr != nil {
 		return false
 	}
@@ -652,6 +732,7 @@ func (s *SendStream) maybeGetRetransmission(maxBytes protocol.ByteCount, v proto
 		return newFrame, true
 	}
 	s.retransmissionQueue = s.retransmissionQueue[1:]
+	s.countRetx(f, -1)
 	return f, len(s.retransmissionQueue) > 0
 }
 
@@ -751,6 +832,7 @@ func (s *SendStream) returnFramesToPool() {
 	}
 	clear(s.retransmissionQueue)
 	s.retransmissionQueue = nil
+	s.controlRetx = 0
 	if s.nextFrame != nil {
 		s.nextFrame.PutBack()
 		s.nextFrame = nil
@@ -828,12 +910,28 @@ func (s *SendStream) CancelWrite(errorCode StreamErrorCode) {
 				}
 			}
 			s.retransmissionQueue = retransmissionQueue
+			s.recountRetx()
 		}
 	}
+	// What survives below a reliable boundary may now be of another class
+	// than the stream was filed as; the classes of cancelled bytes go.
+	if s.classTagged {
+		end := s.heldEnd()
+		if r := s.reliableOffset(); r > 0 {
+			// Bytes past the reliable offset will never be sent, an
+			// in-progress write's included.
+			end = min(end, r)
+		}
+		s.trimClassSegs(end)
+	}
+	refile := s.classTagged && s.holdsData()
 	s.mutex.Unlock()
 
 	s.signalWrite()
 	s.sender.onHasStreamControlFrame(s.streamID, s)
+	if refile {
+		s.sender.onHasStreamData(s.streamID, s)
+	}
 }
 
 func (s *SendStream) enableResetStreamAt() {
@@ -1026,6 +1124,7 @@ func (s *sendStreamAckHandler) OnLost(f wire.Frame) {
 
 	sf.DataLenPresent = true
 	s.retransmissionQueue = append(s.retransmissionQueue, sf)
+	(*SendStream)(s).countRetx(sf, 1)
 	s.mutex.Unlock()
 
 	s.sender.onHasStreamData(s.streamID, (*SendStream)(s))

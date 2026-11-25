@@ -4,6 +4,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/apernet/quic-go/congestion"
 	"github.com/apernet/quic-go/internal/ackhandler"
 	"github.com/apernet/quic-go/internal/monotime"
 	"github.com/apernet/quic-go/internal/protocol"
@@ -36,6 +37,24 @@ type framer struct {
 	streamQueue              ringbuffer.RingBuffer[protocol.StreamID]
 	streamsWithControlFrames map[protocol.StreamID]streamControlFrameGetter
 
+	// classed is set while the connection's PathSender schedules classes.
+	// Active streams are then queued in classRings by effective class
+	// instead of in streamQueue, round-robin within a class. ringOf is the
+	// one live entry of each filed stream; any other entry is stale and
+	// skipped. See framer_class.go.
+	classed    bool
+	classRings [congestion.NumSendClasses]ringbuffer.RingBuffer[ringEntry]
+	ringOf     map[protocol.StreamID]ringEntry
+	liveIn     [congestion.NumSendClasses]int
+	serving    bool // a ring is being served; no compaction meanwhile
+	// boundSmallScans is set while the packet being built already carries
+	// work; see appendClassStreams.
+	boundSmallScans bool
+	// heldStreamControl are streams' control frames taken by a CONTROL pass
+	// whose allowance they did not fit; they go first in a later one.
+	heldStreamControl []ackhandler.Frame
+	ringGen           uint64
+
 	controlFrameMutex sync.Mutex
 	controlFrames     []wire.Frame
 	// exemptFrames are obligations that may be sent without a permit, such
@@ -56,14 +75,14 @@ func newFramer(connFlowController *connectionFlowController) *framer {
 
 func (f *framer) HasData() bool {
 	f.mutex.Lock()
-	hasData := !f.streamQueue.Empty()
+	hasData := !f.streamQueue.Empty() || (f.classed && f.hasClassedStreams())
 	f.mutex.Unlock()
 	if hasData {
 		return true
 	}
 	f.controlFrameMutex.Lock()
 	defer f.controlFrameMutex.Unlock()
-	return len(f.streamsWithControlFrames) > 0 || len(f.controlFrames) > 0 || len(f.pathResponses) > 0 || len(f.exemptFrames) > 0
+	return len(f.streamsWithControlFrames) > 0 || len(f.controlFrames) > 0 || len(f.pathResponses) > 0 || len(f.exemptFrames) > 0 || len(f.heldStreamControl) > 0
 }
 
 // QueueExemptFrame queues a frame that may be sent without a permit. Its
@@ -89,7 +108,7 @@ func (f *framer) HasExemptData() bool {
 func (f *framer) HasControlData() bool {
 	f.controlFrameMutex.Lock()
 	defer f.controlFrameMutex.Unlock()
-	return len(f.streamsWithControlFrames) > 0 || len(f.controlFrames) > 0
+	return len(f.streamsWithControlFrames) > 0 || len(f.controlFrames) > 0 || len(f.heldStreamControl) > 0
 }
 
 // HasStreamData says whether a queued stream could send a frame now. It
@@ -178,6 +197,11 @@ func (f *framer) Append(
 	var lastFrame ackhandler.StreamFrame
 	var streamFrameLen protocol.ByteCount
 	f.mutex.Lock()
+	if f.classed {
+		// A build outside class scheduling's own (a PTO probe) takes the
+		// classes in priority order.
+		return f.appendAllClasses(frames, streamFrames, controlFrameLen, maxLen, v)
+	}
 	// pop STREAM frames, until less than 128 bytes are left in the packet
 	numActiveStreams := f.streamQueue.Len()
 	for range numActiveStreams {
@@ -240,12 +264,59 @@ func (f *framer) appendControlFrames(
 ) ([]ackhandler.Frame, protocol.ByteCount) {
 	// add a PATH_RESPONSE first, but only pack a single PATH_RESPONSE per packet
 	frames, length := f.appendExemptFrames(frames, maxLen, v)
+	return f.appendOrdinaryControlFrames(frames, length, maxLen, now, v)
+}
 
+// appendOrdinaryControlFrames appends the queued control frames that are not
+// exempt obligations, after length bytes already in the packet.
+func (f *framer) appendOrdinaryControlFrames(
+	frames []ackhandler.Frame,
+	length protocol.ByteCount,
+	maxLen protocol.ByteCount,
+	now monotime.Time,
+	v protocol.Version,
+) ([]ackhandler.Frame, protocol.ByteCount) {
+	frames, length = f.appendStreamControlFramesBelow(frames, length, maxLen, maxStreamControlFrameSize, now, v)
+	for len(f.controlFrames) > 0 {
+		frame := f.controlFrames[len(f.controlFrames)-1]
+		frameLen := frame.Length(v)
+		if length+frameLen > maxLen {
+			break
+		}
+		frames = append(frames, ackhandler.Frame{Frame: frame})
+		length += frameLen
+		f.controlFrames = f.controlFrames[:len(f.controlFrames)-1]
+	}
+	return frames, length
+}
+
+// appendStreamControlFramesBelow appends the streams' control frames while
+// more than maxFrame bytes are left.
+func (f *framer) appendStreamControlFramesBelow(
+	frames []ackhandler.Frame,
+	length protocol.ByteCount,
+	maxLen protocol.ByteCount,
+	maxFrame protocol.ByteCount,
+	now monotime.Time,
+	v protocol.Version,
+) ([]ackhandler.Frame, protocol.ByteCount) {
+	// Frames a class-scheduled pass held (empty unless the connection
+	// scheduled classes) go first.
+	for len(f.heldStreamControl) > 0 {
+		fr := f.heldStreamControl[0]
+		l := fr.Frame.Length(v)
+		if l > maxLen-length {
+			break
+		}
+		frames = append(frames, fr)
+		length += l
+		f.heldStreamControl = f.heldStreamControl[1:]
+	}
 	// add stream-related control frames
 	for id, str := range f.streamsWithControlFrames {
 	start:
 		remainingLen := maxLen - length
-		if remainingLen <= maxStreamControlFrameSize {
+		if remainingLen <= maxFrame {
 			break
 		}
 		fr, ok, hasMore := str.getControlFrame(now)
@@ -264,17 +335,6 @@ func (f *framer) appendControlFrames(
 		}
 	}
 
-	for len(f.controlFrames) > 0 {
-		frame := f.controlFrames[len(f.controlFrames)-1]
-		frameLen := frame.Length(v)
-		if length+frameLen > maxLen {
-			break
-		}
-		frames = append(frames, ackhandler.Frame{Frame: frame})
-		length += frameLen
-		f.controlFrames = f.controlFrames[:len(f.controlFrames)-1]
-	}
-
 	return frames, length
 }
 
@@ -289,6 +349,11 @@ func (f *framer) QueuedTooManyControlFrames() bool {
 
 func (f *framer) AddActiveStream(id protocol.StreamID, str streamFrameGetter) {
 	f.mutex.Lock()
+	if f.classed {
+		f.fileStream(id, str)
+		f.mutex.Unlock()
+		return
+	}
 	if _, ok := f.activeStreams[id]; !ok {
 		f.streamQueue.PushBack(id)
 		f.activeStreams[id] = str
@@ -307,6 +372,9 @@ func (f *framer) AddStreamWithControlFrames(id protocol.StreamID, str streamCont
 // RemoveActiveStream is called when a stream completes.
 func (f *framer) RemoveActiveStream(id protocol.StreamID) {
 	f.mutex.Lock()
+	if f.classed {
+		f.unfile(id)
+	}
 	delete(f.activeStreams, id)
 	// We don't delete the stream from the streamQueue,
 	// since we'd have to iterate over the ringbuffer.
@@ -349,7 +417,13 @@ func (f *framer) Handle0RTTRejection() {
 	for id := range f.activeStreams {
 		delete(f.activeStreams, id)
 	}
+	for i := range f.classRings {
+		f.classRings[i].Clear()
+	}
+	clear(f.ringOf)
+	f.liveIn = [congestion.NumSendClasses]int{}
 	clear(f.streamsWithControlFrames)
+	f.heldStreamControl = nil
 	var j int
 	for i, frame := range f.controlFrames {
 		switch frame.(type) {

@@ -124,10 +124,10 @@ type Demand struct{ Eligible [NumSendClasses]bool }
 // Permit is the answer to Admit. A permit reserves nothing: it is a value
 // owned by one build operation, and all state changes at OnSent.
 //
-// The packet builder does not yet honour Turn, Fill or MaxBytes: it fills a
-// permitted packet as it would any other, up to the connection's packet size.
-// A PathSender must therefore admit whole packets of any class. Building
-// under the permit's class and limits is a later change.
+// The packet builder executes Turn, Fill and MaxBytes only for a PathSender
+// that is a ClassScheduler. For any other PathSender it fills a permitted
+// packet as it would any other, up to the connection's packet size, so such a
+// PathSender must admit whole packets of any class.
 type Permit struct {
 	OK   bool
 	Turn SendClass
@@ -139,6 +139,57 @@ type Permit struct {
 	// when the refusal is window-limited.
 	RetryAt monotime.Time
 }
+
+// ClassScheduler is a PathSender that arbitrates between send classes and
+// whose permits the packet builder executes. When SchedulesClasses reports
+// true at installation, every packet built under a permit:
+//
+//   - is at most MaxBytes long;
+//   - carries bytes of class Turn first, then, in the order CONTROL,
+//     INTERACTIVE, BULK, bytes of each other class up to its Fill allowance,
+//     and otherwise goes out short;
+//   - carries exempt obligations (an ACK, PATH_RESPONSE, a liveness PING)
+//     whatever its turn.
+//
+// Stream bytes are classed by SendStream.WriteClass and SetBoost, DATAGRAM
+// frames are INTERACTIVE, and control frames, their retransmissions, window
+// updates and post-handshake crypto data are CONTROL. Demand is reported per
+// class, and SentPacket.ClassBytes reports the bytes actually built by class,
+// with the packet overhead charged to the turn. A datagram that does not fit
+// a class's allowance stays queued. PTO probes and MTU probes are built
+// without regard to the turn; an MTU probe's bytes are INTERACTIVE, and a
+// probe goes only under a permit whose MaxBytes covers the largest probe
+// (protocol.MaxPacketBufferSize), so a smaller permit is never exceeded.
+//
+// Permits are executed from handshake confirmation on. Before it, packets
+// are coalesced with Initial and Handshake packets whose CRYPTO data and
+// padding the handshake dictates; a permit then admits the packet, but the
+// builder fills it as for any other PathSender, and SentPacket.ClassBuilt
+// is false. ClassBytes still reports what it carried by class.
+//
+// A permit's MaxBytes must be at least MinClassedPermit. A smaller permit
+// is treated as a window refusal: the connection sends only its exempt
+// obligations, due ACKs among them, until a usable permit comes.
+type ClassScheduler interface {
+	PathSender
+	SchedulesClasses() bool
+}
+
+// EmptyBuildObserver is a ClassScheduler that wants to know when a packet
+// admitted under one of its permits could not be built, although the
+// connection still reports demand and the demand did not change -- the work
+// the turn was given to does not fit the permit (a datagram larger than a
+// short MaxBytes, say). It is called on the connection's run loop with that
+// permit. The connection does not retry by itself; the scheduler may change
+// its decision and call the wake function it got at OnAttach.
+type EmptyBuildObserver interface {
+	OnEmptyBuild(now monotime.Time, p Permit)
+}
+
+// MinClassedPermit is the smallest packet a class-scheduled permit may
+// allow: room for the header, the AEAD tag, a truncated ACK frame and some
+// class work, whatever the connection ID and packet number lengths.
+const MinClassedPermit ByteCount = 128
 
 // SentPacket describes a packet as it was actually built and registered.
 type SentPacket struct {
@@ -160,6 +211,11 @@ type SentPacket struct {
 	// Grant is the ID of the verification grant the packet was built under,
 	// or zero.
 	Grant uint64
+	// ClassBuilt says the builder executed the permit's Turn, Fill and
+	// MaxBytes (ClassScheduler). A packet built under a permit without it
+	// -- before handshake confirmation, or a PTO probe -- was admitted by
+	// the permit but filled as for any PathSender.
+	ClassBuilt bool
 }
 
 // PacketRef names one packet.

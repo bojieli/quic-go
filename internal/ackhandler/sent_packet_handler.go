@@ -109,12 +109,19 @@ type sentPacketHandler struct {
 	pathSender congestionExt.PathSender
 	// permit is the answer to the last Admit. It covers the next packet only.
 	permit congestionExt.Permit
+	// classed says the installed PathSender schedules classes
+	// (congestion.ClassScheduler): packets are classed by the class their
+	// bytes were served at, and overhead is charged to the permit's turn.
+	classed bool
 	// admissionRefused says the last SendMode refused for the PathSender,
 	// not for a transport limit.
 	admissionRefused bool
 	// grantPending is the verification grant the next packet was built
 	// under, or zero.
 	grantPending uint64
+	// classBuiltPending says the next packet was built executing its
+	// permit's class decision.
+	classBuiltPending bool
 	// ackLenPending is the size of the next packet's ACK frame.
 	ackLenPending protocol.ByteCount
 	// discardRefs is scratch space for OnDiscarded.
@@ -173,6 +180,9 @@ type lostRecord struct {
 	sent     monotime.Time
 	reported bool   // to a PathSender
 	gen      uint32 // the PathSender it was reported to
+	// counted says the loss was added to the connection's PacketsLost and
+	// BytesLost by the transport, which takes it back on a correction.
+	counted bool
 }
 
 // clientAddressValidated indicates whether the address was validated beforehand by an address validation token.
@@ -383,7 +393,7 @@ func (h *sentPacketHandler) SentPacket(
 		pnSpace.history.SentPathProbePacket(pn, p)
 		if ps != nil {
 			h.ackLenPending = 0
-			ps.OnSent(h.sentPacketInfo(t, encLevel, pn, p, congestionExt.KindPathProbe, true, 0))
+			ps.OnSent(h.sentPacketInfo(t, encLevel, pn, p, congestionExt.KindPathProbe, true, 0, false))
 		}
 		h.setLossDetectionTimer(t)
 		return
@@ -411,8 +421,11 @@ func (h *sentPacketHandler) SentPacket(
 		}
 		ackLen := h.ackLenPending
 		h.ackLenPending = 0
-		info := h.sentPacketInfo(t, encLevel, pn, p, kind, !underPermit, ackLen)
+		classBuilt := h.classBuiltPending
+		h.classBuiltPending = false
+		info := h.sentPacketInfo(t, encLevel, pn, p, kind, !underPermit, ackLen, classBuilt)
 		info.Grant = grant
+		info.ClassBuilt = classBuilt && underPermit
 		ps.OnSent(info)
 	} else {
 		cc.OnPacketSent(t, h.bytesInFlight, pn, size, isAckEliciting)
@@ -610,7 +623,13 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	}
 
 	if ps == nil {
-		if cex, ok := cc.(congestion.SendAlgorithmEx); ok &&
+		// The aggregate event goes to the controller that received this
+		// ACK's per-packet callbacks, and is withheld from it if it was
+		// replaced while they were delivered, and never redirected to its
+		// successor. A replacement on another goroutine that races the call
+		// itself is not excluded: legacy controllers are swapped outside the
+		// run loop, as before.
+		if cex, ok := cc.(congestion.SendAlgorithmEx); ok && h.getCongestionControl() == cc &&
 			(len(h.ackedPacketsInfo) != 0 || len(h.lostPacketsInfo) != 0) {
 			cex.OnCongestionEventEx(priorInFlight, rcvTime, h.ackedPacketsInfo, h.lostPacketsInfo)
 		}
@@ -739,6 +758,11 @@ func (h *sentPacketHandler) creditLateAcks(ack *wire.AckFrame, rcvTime monotime.
 			h.progress.Epoch++
 			h.progress.Last = rcvTime
 			h.progress.PTOExpiries = 0
+			if rec.counted {
+				// A spurious loss: the transport takes back what it counted.
+				h.connStats.PacketsLost.Add(^uint64(0))
+				h.connStats.BytesLost.Add(^uint64(rec.size - 1))
+			}
 			if ps != nil && rec.reported && rec.gen == h.controllerGen {
 				refs = append(refs, congestionExt.PacketRef{Space: congestionExt.SpaceApplication, Number: congestionExt.PacketNumber(rec.pn), Bytes: congestionExt.ByteCount(rec.size)})
 			}
@@ -1113,7 +1137,7 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 					BytesLost:    congestionExt.ByteCount(p.Length),
 				})
 				if encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT {
-					h.recordLateAck(lostRecord{pn: pn, size: p.Length, sent: p.SendTime, reported: ps != nil, gen: h.controllerGen})
+					h.recordLateAck(lostRecord{pn: pn, size: p.Length, sent: p.SendTime, reported: ps != nil, gen: h.controllerGen, counted: ps != nil && !p.IsPathMTUProbePacket})
 				}
 				if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
 					h.ecnTracker.LostPacket(pn)
@@ -1333,6 +1357,11 @@ func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
 // controller.
 func (h *sentPacketHandler) pathSenderSendMode(ps congestionExt.PathSender, now monotime.Time, numTrackedPackets int) SendMode {
 	h.permit = ps.Admit(now, congestionExt.ByteCount(h.maxDatagramSize))
+	if h.classed && h.permit.OK && h.permit.MaxBytes < congestionExt.MinClassedPermit {
+		// Too small to build a packet in: a window refusal, so the exempt
+		// obligations, due ACKs among them, still go.
+		h.permit = congestionExt.Permit{}
+	}
 	// The transport's outstanding-packet limit comes first: whatever the
 	// controller answered, only an ACK may go, and no exempt obligation or
 	// grant may spend the headroom kept for ACKs.
@@ -1563,6 +1592,7 @@ func (h *sentPacketHandler) SetCongestionControl(cc congestionExt.CongestionCont
 	h.congestionMutex.Lock()
 	old := h.pathSender
 	h.pathSender = nil
+	h.classed = false
 	cc.SetRTTStatsProvider(h.rttStats)
 	if ccEx, isEx := cc.(congestionExt.CongestionControlEx); isEx {
 		h.congestion = &ccAdapterEx{ccEx}
@@ -1593,6 +1623,7 @@ func (h *sentPacketHandler) InstallPathSender(ps congestionExt.PathSender, now m
 	h.congestionMutex.Lock()
 	h.congestion = &ccAdapter{ps}
 	h.pathSender = ps
+	h.classed = SchedulesClasses(ps)
 	h.permit = congestionExt.Permit{}
 	h.controllerGen++
 	h.congestionMutex.Unlock()
@@ -1603,6 +1634,7 @@ func (h *sentPacketHandler) DetachPathSender(now monotime.Time) {
 	h.congestionMutex.Lock()
 	ps := h.pathSender
 	h.pathSender = nil
+	h.classed = false
 	h.congestionMutex.Unlock()
 	if ps != nil {
 		ps.OnDetach(now)
@@ -1613,6 +1645,23 @@ func (h *sentPacketHandler) DetachPathSender(now monotime.Time) {
 // refused admission. A transport limit (the outstanding-packet limit) is not
 // an admission refusal, and grants the exempt path no more than an ACK.
 func (h *sentPacketHandler) AdmissionRefused() bool { return h.admissionRefused }
+
+// SchedulesClasses says whether a PathSender asks the builder to execute
+// its class decisions.
+func SchedulesClasses(ps congestionExt.PathSender) bool {
+	cs, ok := ps.(congestionExt.ClassScheduler)
+	return ok && cs.SchedulesClasses()
+}
+
+// Permit is the permit the next packet is built under, and whether the
+// installed PathSender schedules classes. Run loop only.
+func (h *sentPacketHandler) Permit() (congestionExt.Permit, bool) {
+	return h.permit, h.classed && h.pathSender != nil
+}
+
+// ExpectClassBuilt says the next packet was built executing its permit's
+// class decision.
+func (h *sentPacketHandler) ExpectClassBuilt() { h.classBuiltPending = true }
 
 // ExpectGrantedPacket says the next packet was built under a verification
 // grant.
@@ -1700,7 +1749,7 @@ func (h *sentPacketHandler) packetKind(encLevel protocol.EncryptionLevel, p *pac
 // classed by frame type: stream data is BULK, DATAGRAM frames INTERACTIVE,
 // ACK, PING and path validation EXEMPT, anything else CONTROL. Packet
 // overhead is charged to the first non-exempt class the packet carries.
-func (h *sentPacketHandler) sentPacketInfo(t monotime.Time, encLevel protocol.EncryptionLevel, pn protocol.PacketNumber, p *packet, kind congestionExt.PacketKind, exempt bool, ackLen protocol.ByteCount) congestionExt.SentPacket {
+func (h *sentPacketHandler) sentPacketInfo(t monotime.Time, encLevel protocol.EncryptionLevel, pn protocol.PacketNumber, p *packet, kind congestionExt.PacketKind, exempt bool, ackLen protocol.ByteCount, classBuilt bool) congestionExt.SentPacket {
 	info := congestionExt.SentPacket{
 		Space:           spaceOf(encLevel),
 		Number:          congestionExt.PacketNumber(pn),
@@ -1717,7 +1766,12 @@ func (h *sentPacketHandler) sentPacketInfo(t monotime.Time, encLevel protocol.En
 	info.ClassBytes[congestionExt.ClassExempt] += congestionExt.ByteCount(framed)
 	for _, f := range p.StreamFrames {
 		n := f.Frame.Length(protocol.Version1)
-		info.ClassBytes[congestionExt.ClassBulk] += congestionExt.ByteCount(n)
+		class := congestionExt.ClassBulk
+		if h.classed && f.Frame.Class != 0 {
+			// The class the bytes were served at.
+			class = congestionExt.SendClass(f.Frame.Class)
+		}
+		info.ClassBytes[class] += congestionExt.ByteCount(n)
 		framed += n
 	}
 	for _, f := range p.Frames {
@@ -1733,13 +1787,26 @@ func (h *sentPacketHandler) sentPacketInfo(t monotime.Time, encLevel protocol.En
 			info.ClassBytes[congestionExt.ClassControl] += congestionExt.ByteCount(n)
 		}
 	}
+	if h.classed && p.IsPathMTUProbePacket {
+		// An MTU probe is INTERACTIVE work, whatever it is made of.
+		info.ClassBytes = [congestionExt.NumSendClasses]congestionExt.ByteCount{}
+		info.ClassBytes[congestionExt.ClassExempt] = congestionExt.ByteCount(min(ackLen, p.Length))
+		info.ClassBytes[congestionExt.ClassInteractive] = congestionExt.ByteCount(p.Length) - info.ClassBytes[congestionExt.ClassExempt]
+		return info
+	}
 	if framed < p.Length {
 		overhead := congestionExt.ByteCount(p.Length - framed)
 		class := congestionExt.ClassExempt
-		for _, c := range []congestionExt.SendClass{congestionExt.ClassControl, congestionExt.ClassInteractive, congestionExt.ClassBulk} {
-			if info.ClassBytes[c] > 0 {
-				class = c
-				break
+		if turn := h.permit.Turn; h.classed && classBuilt && !exempt && h.permit.OK && turn < congestionExt.NumSendClasses {
+			// A class-built packet's overhead is its turn's, even when only
+			// fill classes, or only exempt frames, found room in it.
+			class = turn
+		} else {
+			for _, c := range []congestionExt.SendClass{congestionExt.ClassControl, congestionExt.ClassInteractive, congestionExt.ClassBulk} {
+				if info.ClassBytes[c] > 0 {
+					class = c
+					break
+				}
 			}
 		}
 		info.ClassBytes[class] += overhead
