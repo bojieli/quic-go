@@ -794,7 +794,7 @@ func TestClassedBuilderTakesAnEarlyAckOnlyForADatagramThatFitsBesideIt(t *testin
 		require.NoError(t, rph.ReceivedPacket(4, protocol.ECNNon, protocol.Encryption1RTT, now, false))
 		require.False(t, rph.HasAckDue(now), "setup: the ACK is not due yet")
 		h.packer.acks = rph
-		ackLen := rph.AckFrameLength(now, protocol.Version1)
+		ackLen := rph.AckFrameLength(now, testPayload, protocol.Version1)
 		require.NotZero(t, ackLen)
 
 		// A datagram that fits the payload alone but not beside the ACK, or
@@ -820,7 +820,7 @@ func TestClassedBuilderTakesAnEarlyAckOnlyForADatagramThatFitsBesideIt(t *testin
 			require.LessOrEqual(t, pl.length, testPayload)
 		} else {
 			require.Nil(t, pl.ack, "the ACK was taken for a datagram that cannot ride with it")
-			require.Equal(t, ackLen, rph.AckFrameLength(now, protocol.Version1), "the ACK stays for a later packet")
+			require.Equal(t, ackLen, rph.AckFrameLength(now, testPayload, protocol.Version1), "the ACK stays for a later packet")
 		}
 	}
 }

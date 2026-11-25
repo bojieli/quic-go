@@ -2694,10 +2694,9 @@ func (c *Conn) triggerSending(now monotime.Time) error {
 	c.pacingDeadline = 0
 	if c.pathSender != nil {
 		c.updateDemand()
-		c.requestMTUProbeAdmission(now)
 	}
 
-	sendMode := c.sentPacketHandler.SendMode(now)
+	sendMode := c.admitFirstPacket(now)
 	switch sendMode {
 	case ackhandler.SendAny:
 		return c.sendPackets(now)
@@ -3051,18 +3050,37 @@ func (c *Conn) setClassed(on bool) {
 	c.demand = congestion.Demand{}
 }
 
-// requestMTUProbeAdmission asks the next admission of a class-scheduled
-// connection to cover the MTU probe that is due, which is larger than an
-// ordinary packet. A scheduler that grants what it is asked would otherwise
-// never issue a permit the probe fits. The probe is not taken from the
-// discoverer, so not in flight, until a permit covers it.
-func (c *Conn) requestMTUProbeAdmission(now monotime.Time) {
-	if !c.classed || !c.handshakeConfirmed || c.mtuDiscoverer == nil || !c.mtuDiscoverer.ShouldSendProbe(now) {
-		return
+// admitFirstPacket is SendMode for the first packet of a send pass. While an
+// MTU probe is due on a class-scheduled connection, admission is asked for
+// the probe's size, which is larger than an ordinary packet: a scheduler that
+// grants what it is asked would otherwise never issue a permit the probe
+// fits. The probe is not taken from the discoverer, so not in flight, until a
+// permit covers it. A scheduler may refuse the probe's size and still admit
+// an ordinary packet, so a refusal is followed by an ordinary admission, and
+// the probe stays due.
+func (c *Conn) admitFirstPacket(now monotime.Time) ackhandler.SendMode {
+	if !c.requestMTUProbeAdmission(now) {
+		return c.sentPacketHandler.SendMode(now)
 	}
-	if r, ok := c.sentPacketHandler.(interface{ RequestAdmission(protocol.ByteCount) }); ok {
-		r.RequestAdmission(c.mtuDiscoverer.NextProbeSize())
+	mode := c.sentPacketHandler.SendMode(now)
+	if mode == ackhandler.SendAny || !c.sentPacketHandler.AdmissionRefused() {
+		return mode
 	}
+	return c.sentPacketHandler.SendMode(now)
+}
+
+// requestMTUProbeAdmission asks the next admission to cover the MTU probe
+// that is due, and reports whether it did.
+func (c *Conn) requestMTUProbeAdmission(now monotime.Time) bool {
+	if c.pathSender == nil || !c.classed || !c.handshakeConfirmed || c.mtuDiscoverer == nil || !c.mtuDiscoverer.ShouldSendProbe(now) {
+		return false
+	}
+	r, ok := c.sentPacketHandler.(interface{ RequestAdmission(protocol.ByteCount) })
+	if !ok {
+		return false
+	}
+	r.RequestAdmission(c.mtuDiscoverer.NextProbeSize())
+	return true
 }
 
 // permitCoversMTUProbe says whether the packet about to be built may be the

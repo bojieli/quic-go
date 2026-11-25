@@ -91,15 +91,17 @@ func (h *ReceivedPacketHandler) HasAckDue(now monotime.Time) bool {
 }
 
 // AckFrameLength is the length of the application-data ACK frame that
-// GetAckFrame(protocol.Encryption1RTT, now, false) would return, or zero when
-// it would return none. It consumes nothing.
-func (h *ReceivedPacketHandler) AckFrameLength(now monotime.Time, v protocol.Version) protocol.ByteCount {
+// GetAckFrame(protocol.Encryption1RTT, now, false) would return, truncated to
+// maxLen as a packet builder truncates it, or zero when it would return none.
+// It consumes nothing.
+func (h *ReceivedPacketHandler) AckFrameLength(now monotime.Time, maxLen protocol.ByteCount, v protocol.Version) protocol.ByteCount {
 	t := &h.appDataPackets
 	if !t.hasNewAck {
 		return 0
 	}
 	t.fillAckFrame(&h.peekAck)
 	h.peekAck.DelayTime = max(0, now.Sub(t.largestObservedRcvdTime))
+	h.peekAck.Truncate(maxLen, v)
 	return h.peekAck.Length(v)
 }
 

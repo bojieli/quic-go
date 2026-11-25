@@ -185,7 +185,7 @@ func (p *packetPacker) permitHasWork(permit congestion.Permit, hasRetransmission
 		// Only a datagram the packet has room for beside the ACK that
 		// would be taken for it, within its fill allowance.
 		if d := p.datagramQueue.Peek(); d != nil {
-			budget := maxPayloadSize - p.ackFrameLength(now, v)
+			budget := maxPayloadSize - p.ackFrameLength(now, maxPayloadSize, v)
 			if permit.Turn != congestion.ClassInteractive {
 				budget = min(budget, protocol.ByteCount(permit.Fill[congestion.ClassInteractive]))
 			}
@@ -203,13 +203,15 @@ func (p *packetPacker) permitHasWork(permit congestion.Permit, hasRetransmission
 	return false
 }
 
-// ackFrameLength is the length of the 1-RTT ACK frame a packet built now
-// would take early, without taking it; zero if the ACK source cannot say.
-func (p *packetPacker) ackFrameLength(now monotime.Time, v protocol.Version) protocol.ByteCount {
+// ackFrameLength is the length of the 1-RTT ACK frame a packet with
+// maxPayloadSize bytes of payload built now would take early, truncated as
+// the builder truncates it, without taking it; zero if the ACK source cannot
+// say.
+func (p *packetPacker) ackFrameLength(now monotime.Time, maxPayloadSize protocol.ByteCount, v protocol.Version) protocol.ByteCount {
 	if a, ok := p.acks.(interface {
-		AckFrameLength(monotime.Time, protocol.Version) protocol.ByteCount
+		AckFrameLength(monotime.Time, protocol.ByteCount, protocol.Version) protocol.ByteCount
 	}); ok {
-		return a.AckFrameLength(now, v)
+		return a.AckFrameLength(now, maxPayloadSize, v)
 	}
 	return 0
 }
