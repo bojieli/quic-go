@@ -92,7 +92,12 @@ func (q *retransmissionQueue) GetFittingFrame(maxLen protocol.ByteCount, v proto
 	}
 	for i, f := range r.other {
 		if f.Length(v) <= maxLen {
-			r.other = append(r.other[:i], r.other[i+1:]...)
+			if i == 0 {
+				// The common case, in constant time, as GetFrame.
+				r.other = r.other[1:]
+			} else {
+				r.other = append(r.other[:i], r.other[i+1:]...)
+			}
 			return f
 		}
 	}

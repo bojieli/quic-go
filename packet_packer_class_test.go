@@ -595,3 +595,23 @@ func TestClassedControlRetransmissionsSkipWhatDoesNotFit(t *testing.T) {
 	require.IsType(t, &wire.MaxDataFrame{}, pl.frames[0].Frame)
 	require.True(t, h.packer.retransmissionQueue.HasData(protocol.Encryption1RTT), "the larger frame stays queued")
 }
+
+// Draining a backlog of control retransmissions that all fit takes them in
+// order, from the front.
+func TestClassedControlRetransmissionsDrainInOrder(t *testing.T) {
+	h := newBuilderHarness(true)
+	for i := range 100 {
+		h.packer.retransmissionQueue.addAppData(&wire.MaxStreamsFrame{MaxStreamNum: protocol.StreamNum(i + 1)})
+	}
+	var got []protocol.StreamNum
+	for range 20 {
+		pl := h.packer.composeClassedPacket(testPayload, testPayload, congestion.Permit{OK: true, Turn: congestion.ClassControl, MaxBytes: 1252}, true, monotime.Now(), protocol.Version1)
+		for _, f := range pl.frames {
+			got = append(got, f.Frame.(*wire.MaxStreamsFrame).MaxStreamNum)
+		}
+	}
+	require.Len(t, got, 100)
+	for i, n := range got {
+		require.Equal(t, protocol.StreamNum(i+1), n)
+	}
+}

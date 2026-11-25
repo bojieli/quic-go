@@ -288,3 +288,21 @@ func TestCancelWriteRefilesTheReliablePrefix(t *testing.T) {
 	_, sfs, _ := h.framer.AppendClass(nil, nil, congestion.ClassBulk, 1200, true, monotime.Now(), protocol.Version1)
 	require.Len(t, sfs, 1, "the reliable prefix is stranded in the CONTROL ring")
 }
+
+// Cancelling with a reliable boundary drops the classes of the bytes it
+// cancels: a BULK prefix is not filed as CONTROL for a CONTROL write
+// beyond the boundary that will never be sent.
+func TestCancelWriteForgetsTheClassOfCancelledBytes(t *testing.T) {
+	h := newBuilderHarness(true)
+	str := h.stream(48)
+	str.enableResetStreamAt()
+	writeClassBuffered(t, str, 100, congestion.ClassBulk)
+	str.SetReliableBoundary() // at 100
+	writeClassBuffered(t, str, 100, congestion.ClassControl)
+	require.Equal(t, congestion.ClassControl, str.streamClass())
+	str.CancelWrite(1)
+	require.Equal(t, congestion.ClassBulk, str.streamClass())
+	_, sfs, _ := h.framer.AppendClass(nil, nil, congestion.ClassBulk, 1200, true, monotime.Now(), protocol.Version1)
+	require.Len(t, sfs, 1, "the reliable prefix is filed as CONTROL")
+	require.Equal(t, protocol.ByteCount(100), sfs[0].Frame.DataLen())
+}

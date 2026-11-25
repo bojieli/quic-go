@@ -914,7 +914,10 @@ func (s *SendStream) CancelWrite(errorCode StreamErrorCode) {
 		}
 	}
 	// What survives below a reliable boundary may now be of another class
-	// than the stream was filed as.
+	// than the stream was filed as; the classes of cancelled bytes go.
+	if s.classTagged {
+		s.trimClassSegs(s.heldEnd())
+	}
 	refile := s.classTagged && s.holdsData()
 	s.mutex.Unlock()
 

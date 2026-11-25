@@ -2773,7 +2773,9 @@ func (c *Conn) maybeSendExemptPacket(now monotime.Time) error {
 			// A grant bound for a controller not yet installed is not spent
 			// under, or reported to, the one that is.
 			g := c.usableGrant()
-			if g == nil || !now.Before(g.grant.Expiry) || g.remaining <= 0 {
+			// The clock is read here, at the point of use: a grant bound
+			// during this pass's callbacks may already have expired.
+			if g == nil || !monotime.Now().Before(g.grant.Expiry) || g.remaining <= 0 {
 				return ackhandler.StreamFrame{}
 			}
 			// Whatever the packet already holds -- header, AEAD tag, ACK,

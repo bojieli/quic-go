@@ -161,7 +161,8 @@ func (s *SendStream) unsentControlEnd() protocol.ByteCount {
 	held := s.heldEnd()
 	end := s.writeOffset
 	for i, seg := range s.classSegs {
-		if seg.class != congestion.ClassControl {
+		if seg.class != congestion.ClassControl || seg.start >= held {
+			// Not CONTROL, or describing no byte the stream still holds.
 			continue
 		}
 		segEnd := held
