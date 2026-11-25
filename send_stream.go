@@ -578,6 +578,11 @@ func (s *SendStream) popGrantedStreamFrame(maxBytes, start, end protocol.ByteCou
 	if s.writeOffset < start || s.writeOffset >= end {
 		return ackhandler.StreamFrame{}, nil
 	}
+	if len(s.dataForWriting) == 0 && s.nextFrame == nil {
+		// Only a FIN could go: it carries no granted byte, so it is left to
+		// the ordinary builder.
+		return ackhandler.StreamFrame{}, nil
+	}
 	// New data only: retransmissions outside the range stay queued.
 	queued := s.retransmissionQueue
 	s.retransmissionQueue = nil
@@ -603,7 +608,16 @@ func (s *SendStream) hasSendableData(connWindow bool) bool {
 	if len(s.retransmissionQueue) > 0 || s.nextFrameReserved {
 		return true
 	}
-	if s.resetErr != nil || s.writeLimited {
+	if s.prefixRepair != nil && len(s.prefixRepair.data) > 0 {
+		return true // a captured prefix copy
+	}
+	if s.resetErr != nil {
+		// Only the reliable prefix is still owed.
+		if reliable := s.reliableOffset(); reliable == 0 || s.writeOffset >= reliable {
+			return false
+		}
+	}
+	if s.writeLimited {
 		return false
 	}
 	if len(s.dataForWriting) == 0 && s.nextFrame == nil {

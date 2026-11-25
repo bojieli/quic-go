@@ -2809,7 +2809,12 @@ func (c *Conn) BindVerificationGrant(str GrantableStream, g congestion.Verificat
 	if s == nil {
 		return errors.New("verification grant needs a send stream")
 	}
-	if s.sender != streamSender(c) {
+	owner := s.sender
+	if w, ok := owner.(*uniStreamSender); ok {
+		// The send half of a bidirectional stream.
+		owner = w.streamSender
+	}
+	if owner != streamSender(c) {
 		return errors.New("verification grant bound to another connection's stream")
 	}
 	c.pathSenderMx.Lock()
@@ -3161,6 +3166,9 @@ func (c *Conn) sendPackedCoalescedPacket(packet *coalescedPacket, ecn protocol.E
 		largestAcked := protocol.InvalidPacketNumber
 		if p.ack != nil {
 			largestAcked = p.ack.LargestAcked()
+			if c.pathSender != nil {
+				c.sentPacketHandler.ExpectAckLength(p.ack.Length(c.version))
+			}
 		}
 		c.sentPacketHandler.SentPacket(
 			now,
@@ -3193,6 +3201,9 @@ func (c *Conn) sendPackedCoalescedPacket(packet *coalescedPacket, ecn protocol.E
 		largestAcked := protocol.InvalidPacketNumber
 		if p.Ack != nil {
 			largestAcked = p.Ack.LargestAcked()
+			if c.pathSender != nil {
+				c.sentPacketHandler.ExpectAckLength(p.Ack.Length(c.version))
+			}
 		}
 		c.sentPacketHandler.SentPacket(
 			now,

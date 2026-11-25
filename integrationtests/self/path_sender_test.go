@@ -314,7 +314,10 @@ func (g *gatePathSender) granted() map[uint64]int {
 	return m
 }
 
-func readWithin(t *testing.T, str *quic.ReceiveStream, n int, d time.Duration) ([]byte, error) {
+func readWithin(t *testing.T, str interface {
+	io.Reader
+	SetReadDeadline(time.Time) error
+}, n int, d time.Duration) ([]byte, error) {
 	t.Helper()
 	_ = str.SetReadDeadline(time.Now().Add(d))
 	buf := make([]byte, n)
@@ -377,21 +380,26 @@ func TestVerificationGrantWhileWindowBlocked(t *testing.T) {
 	}
 }
 
-// A grant's budget bounds the packet bytes it covers.
+// A grant's budget bounds the packet bytes it covers. The grant is bound to a
+// bidirectional stream here; a stream of another connection is refused.
 func TestVerificationGrantBudget(t *testing.T) {
 	client, server := dialPathSenderPair(t, &quic.Config{})
+	other, _ := dialPathSenderPair(t, &quic.Config{})
 	g := &gatePathSender{}
 	installPathSender(t, client, g)
 	g.blocked.Store(true)
-	str, err := client.OpenUniStream()
+	str, err := client.OpenStream()
 	require.NoError(t, err)
+	foreign, err := other.OpenStream()
+	require.NoError(t, err)
+	require.Error(t, client.BindVerificationGrant(foreign, congestion.VerificationGrant{ID: 6, Start: 0, End: 10, Budget: 1000, Expiry: monotime.Now().Add(time.Second)}))
 	require.NoError(t, client.BindVerificationGrant(str, congestion.VerificationGrant{
 		ID: 7, Start: 0, End: 5000, Budget: 1300, Expiry: monotime.Now().Add(5 * time.Second),
 	}))
 	go func() { _, _ = str.Write(make([]byte, 5000)) }()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	rstr, err := server.AcceptUniStream(ctx)
+	rstr, err := server.AcceptStream(ctx)
 	require.NoError(t, err)
 	got, _ := readWithin(t, rstr, 5000, 300*time.Millisecond)
 	require.NotEmpty(t, got)

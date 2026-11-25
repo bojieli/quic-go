@@ -373,11 +373,9 @@ func (h *sentPacketHandler) SentPacket(
 	// on the run loop while a PathSender is installed.
 	// In a coalesced datagram the permit belongs to the application packet.
 	var underPermit bool
-	if ps != nil {
+	if ps != nil && (encLevel == protocol.Encryption1RTT || encLevel == protocol.Encryption0RTT) {
 		underPermit = h.permit.OK
-		if encLevel == protocol.Encryption1RTT || encLevel == protocol.Encryption0RTT {
-			h.permit = congestionExt.Permit{}
-		}
+		h.permit = congestionExt.Permit{}
 	}
 
 	if isPathProbePacket {
