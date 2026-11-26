@@ -35,3 +35,15 @@ func Until(t Time) time.Duration {
 func FromTime(t time.Time) Time {
 	return monotime.FromTime(t)
 }
+
+// UseHighResolutionClock makes Now read the operating system's
+// high-resolution counter where Go's own clock is coarse, and reports
+// whether it did. It has an effect on Windows only, where time.Now advances
+// once per clock interrupt (15.6 ms by default): too coarse to time a round
+// trip, a delivery-rate sample or a pacing interval on a short path.
+//
+// It is opt-in because a program that fakes time (testing/synctest) needs
+// Now to follow the fake clock. Call it once at program start.
+func UseHighResolutionClock() bool {
+	return monotime.UseHighResolutionClock()
+}
