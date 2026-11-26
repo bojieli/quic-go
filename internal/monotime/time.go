@@ -5,6 +5,7 @@
 package monotime
 
 import (
+	"sync/atomic"
 	"time"
 )
 
@@ -19,9 +20,49 @@ var start = time.Now().Add(-time.Hour)
 // The zero value of Time doesn't have any specific meaning.
 type Time int64
 
+// highRes is set once UseHighResolutionClock has taken effect.
+var highRes atomic.Bool
+
 // Now returns the current monotonic time.
 func Now() Time {
+	if highRes.Load() {
+		return Time(highResNow())
+	}
 	return Time(time.Since(start).Nanoseconds())
+}
+
+// UseHighResolutionClock makes Now read the operating system's
+// high-resolution counter where Go's own clock is coarse, and reports
+// whether it did. It has an effect on Windows only.
+//
+// On Windows, Go reads the time the kernel publishes at each clock interrupt,
+// so time.Now advances in steps of the interrupt period: 15.6 ms unless some
+// process has asked for a shorter one. Two packets sent and acknowledged
+// within one step have the same timestamp. A round trip shorter than the
+// step then measures as zero or as a whole step, a delivery-rate sample over
+// it is undefined or far too low, and a pacer's budget refills once per step.
+//
+// It is opt-in because a program that fakes time (testing/synctest) needs
+// Now to follow the fake clock, which the counter does not. Call it once at
+// program start. Timestamps taken before and after the call are comparable:
+// the counter continues from the value Now had at the call.
+func UseHighResolutionClock() bool {
+	if highRes.Load() {
+		return true
+	}
+	if !startHighRes(time.Since(start).Nanoseconds()) {
+		return false
+	}
+	highRes.Store(true)
+	return true
+}
+
+// counterNanos converts ticks of a counter running at frequency ticks per
+// second to nanoseconds. Whole seconds and the remainder are converted
+// separately: ticks times a billion overflows an int64 after about fifteen
+// minutes at 10 MHz.
+func counterNanos(ticks, frequency int64) int64 {
+	return ticks/frequency*1e9 + ticks%frequency*1e9/frequency
 }
 
 // Sub returns the duration t-t2. If the result exceeds the maximum (or minimum)
